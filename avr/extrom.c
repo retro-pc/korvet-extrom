@@ -70,9 +70,10 @@ static volatile unsigned char led_flag; // 0 - индикация запреще
 static volatile unsigned char boot_flag;   // Флаг начальной загрузки (фаза 1): 0 - корвет еще не загружен, 1 - процесс начальной загрузки окончен
 
 static unsigned char diskfolder[14]; // имя каталога для вновь монтируемых образов
-static volatile char lspt[4];   // Число логических секторов на дорожку для каждого из образов A и B
-static unsigned char Fname[4][14]; // имя файла образа A и B
-static unsigned char Ffolder[4][14]; // имя каталога, хранящего файл образа A и B
+static volatile char lspt[4];   // Число логических секторов на дорожку для каждого из образов 
+static volatile char systracks;   // Число системных дорожек для образа диска А
+static unsigned char Fname[4][14]; // имя файла образа 
+static unsigned char Ffolder[4][14]; // имя каталога, хранящего файл образа 
 static unsigned char bios_flag=0;  // флаг действующей подмены образа A на образ BIOS
 static unsigned char enable_bios_flag=1;  // флаг разрешения такой подмены
 static unsigned char roflag[4];		  // флаг "только чтение" каждого диска: 0-чтение/запись  1-только чтение
@@ -622,7 +623,7 @@ if (dsk>3) {
    return;
 }   
 sbuf[0]=0;
-if (prefix == 1) { 
+if (prefix != 0) { 
   // открытие образа в подкаталоге
   strcpy(sbuf,Ffolder[dsk]);   // имя каталога с образами
   strcat(sbuf,"/");
@@ -642,6 +643,7 @@ if (fs_read(fb, 32, &res) != 0) {
 }
 
 lspt[dsk]=fb[16];       // достаем логический SPT
+if ((dsk == 0) && (prefix != 0)) systracks=fb[29]; // достаем число системных дорожек
 // получаем имя файла для вывода в терминал
 sbuf[0]=0;
 if (prefix == 1) {
@@ -649,7 +651,9 @@ if (prefix == 1) {
   strcat(sbuf,"/");
 }
 strcat(sbuf,filename);
-printf_P(PSTR("\n Mount %c: %s  SPT=%i\n"),'A'+dsk,sbuf,lspt[dsk]);
+printf_P(PSTR("\n Mount %c: %s  SPT=%i"),'A'+dsk,sbuf,lspt[dsk]);
+if (prefix != 0) printf_P(PSTR(" st=%i"),systracks);
+printf_P(PSTR("\n"));
 
 fstatus[dsk]=1;      // взводим флаг - образ смонтирован успешно
 
@@ -993,8 +997,8 @@ switch (cmd) {
      // ------ чтение/запись сектора -----
      // Подмена образа диска на образ BIOS - только для образа 0 и только если разрешено
      if ((drv == 0) && (enable_bios_flag == 1)) {
-       if ((trk<2) && (bios_flag == 0)) { mount_disk(0,sysfiles[substitute_number],0); bios_flag=1; }  // переход на подставную систему
-       if ((trk>=2) && (bios_flag == 1)) { mount_disk(0,Fname[0],1); bios_flag=0; }        // переход на реальный диск A
+       if ((trk<systracks) && (bios_flag == 0)) { mount_disk(0,sysfiles[substitute_number],0); bios_flag=1; }  // переход на подставную систему
+       if ((trk>=systracks) && (bios_flag == 1)) { mount_disk(0,Fname[0],1); bios_flag=0; }        // переход на реальный диск A
      }
      fs_select(drv);   // выбираем блок с открытым файлом
      // проверяем, смонтирован ли образ
