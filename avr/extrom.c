@@ -70,14 +70,14 @@ static volatile unsigned char led_flag; // 0 - индикация запреще
 static volatile unsigned char boot_flag;   // Флаг начальной загрузки (фаза 1): 0 - корвет еще не загружен, 1 - процесс начальной загрузки окончен
 
 static unsigned char diskfolder[14]; // имя каталога для вновь монтируемых образов
-static volatile char lspt[4];   // Число логических секторов на дорожку для каждого из образов 
+static volatile char lspt[5];   // Число логических секторов на дорожку для каждого из образов 
 static volatile char systracks;   // Число системных дорожек для образа диска А
-static unsigned char Fname[4][14]; // имя файла образа 
-static unsigned char Ffolder[4][14]; // имя каталога, хранящего файл образа 
+static unsigned char Fname[5][14]; // имя файла образа 
+static unsigned char Ffolder[5][14]; // имя каталога, хранящего файл образа 
 static unsigned char bios_flag=0;  // флаг действующей подмены образа A на образ BIOS
 static unsigned char enable_bios_flag=1;  // флаг разрешения такой подмены
-static unsigned char roflag[4];		  // флаг "только чтение" каждого диска: 0-чтение/запись  1-только чтение
-static unsigned char fstatus[4];          // флаг результата монтирования: 0 - не смонтирован, 1 - смонтирован
+static unsigned char roflag[5];		  // флаг "только чтение" каждого диска: 0-чтение/запись  1-только чтение
+static unsigned char fstatus[5];          // флаг результата монтирования: 0 - не смонтирован, 1 - смонтирован
 
 // Образ 32 начальных байтов инфосектора, записываемых в создаваемый образ диска
 const char PROGMEM infosector[]={0x80, 0xc3, 0x00, 0xda, 0x0a, 0x00, 0x00, 0x01, 0x01, 0x01, 0x03, 0x01, 0x05, 0x00, 0x50, 0x00,
@@ -618,7 +618,7 @@ void mount_disk(char dsk,char* filename, char prefix){
 unsigned char* sbuf=getsbufptr();  // буфер сектора VinxFS
 unsigned int res;
 
-if (dsk>3) {
+if (dsk>4) {
    printf_P(PSTR("\n некорректный # диска: %i"),dsk);
    return;
 }   
@@ -732,7 +732,7 @@ int i,res,st;
 
 printf_P(PSTR("\nMOUNT.CFG: f=%x  p=%i"),flags,preserve);
 
-fs_select(4);   // блок для служебных файлов
+fs_select(5);   // блок для служебных файлов
 
 strcpy(sbuf,"MOUNT.CFG");    // файл списка монтирования
 res=-1;
@@ -798,7 +798,7 @@ void send_dir() {
 unsigned char* sbuf=getsbufptr();  // буфер сектора VinxFS
 unsigned int i,res,cnt=0;
 
-fs_select(4);   // блок для служебных файлов
+fs_select(5);   // блок для служебных файлов
 strcpy(sbuf,diskfolder);
 fs_opendir();
   printf_P(PSTR("\nКаталог образов"));
@@ -827,7 +827,7 @@ void send_folders() {
 unsigned char* sbuf=getsbufptr();  // буфер сектора VinxFS
 unsigned int i,res,cnt;
 
-fs_select(4);   // блок для служебных файлов
+fs_select(5);   // блок для служебных файлов
 sbuf[0]=0;  // корень карты
 fs_opendir();
   printf_P(PSTR("\nСписок каталогов карты"));
@@ -858,7 +858,7 @@ void set_def_floder(unsigned char sec) {
 unsigned char* sbuf=getsbufptr();  // буфер сектора VinxFS
 unsigned char tmpname[14];
 
-fs_select(4);   // блок для служебных файлов
+fs_select(5);   // блок для служебных файлов
 iop_getbuf(tmpname,14);          // имя каталога
 strcpy(sbuf,tmpname);            // устанавливаем как имя открываемого каталога
 if (fs_opendir() == 0) { 
@@ -977,7 +977,7 @@ if (rcsum != csum) {
 }  
 
 // проверка допустимости номера диска
-if (drv >3) {
+if (drv >4) {
  printf_P(PSTR("\nDRV ERR: %x"),drv);
  iop_send_byte(0);   // ответ Error
  goto nocmd;
@@ -1274,7 +1274,7 @@ res=fs_init(); // монтируем файловую систеу на карт
 if (res != 0) { printf_P(PSTR("\nНет файловой системы:%i"),lastError); led_error(3); }
 
 sbuf[0]=0;   // корень ФС
-fs_select(4);   // блок для служебных файлов
+fs_select(5);   // блок для служебных файлов
 res=fs_opendir();
 if (res != 0) { printf_P(PSTR("\nОшибки в корневом каталоге:%02x"),res); led_error(4); }
 
@@ -1307,13 +1307,9 @@ PORTD=0x50;		// -STB=1    -ACK=1
 
 // заливаем и запускаем загрузчик 2 ступени
 send_loader();
-// снимаем флаги Readonly
-roflag[0]=0;
-roflag[1]=0;
-roflag[2]=0;
-roflag[3]=0;
 
 // разбираем файл конфигурации
+fs_select(5);   // блок для служебных файлов
 strcpy(sbuf,"MOUNT.CFG");    // открываем файл конфигурации
 if (reset_config == 0) res=fs_open();
 if ((reset_config != 0)|| (res != 0)) save_config(0x1f,0);   // файла еще нет или нажата кнопка - записываем в mount.cfg
@@ -1340,6 +1336,7 @@ printf_P(PSTR("\nDefdir: %s"),diskfolder);
 for(i=0;i<2;i++) {     // Для конфигурации без реальных дисководов заменить 2 на 4 !!!!!!!!!!!!1
   printf_P(PSTR("\nDisk %c: %s/%s"),'A'+i,Ffolder[i],Fname[i]);
   mount_disk(i,Fname[i],1);
+  roflag[i]=0;    // снимаем флаги Readonly
 }  
 
 // Далее идет бесконечный цикл ожидания перезагрузки корвета. Вся полезная работа будет идти в прерывании int1 
