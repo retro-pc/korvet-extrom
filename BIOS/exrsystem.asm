@@ -3885,7 +3885,8 @@ CHK03 	EQU EBUF-32  	;check vector 3
 CHK02 	EQU CHK03-32 	;check vector 2
 CHK01 	EQU CHK02-32 	;check vector 1
 CHK00 	EQU CHK01-32 	;check vector 0
-ALL04 	EQU CHK00-18 	; E-диск
+ALL05 	EQU CHK00-18 	; E-диск
+ALL04 	EQU ALL05-18 	;mount-диск
 ALL03 	EQU ALL04-50 	;allocation vector 3
 ALL02 	EQU ALL03-50 	;allocation vector 2
 ALL01 	EQU ALL02-50 	;allocation vector 1
@@ -3977,11 +3978,17 @@ DPH3: DW 0000H,0000H
       DW DIRBF,CPMT03
       DW CHK03,ALL03
 
-;     Диск Е: (электронный)
+;     Диск Е: (mount)
 DPH4: DW 0000H,0000H
       DW 0000H,0000H
       DW DIRBF,CPMT04
       DW 0000H,ALL04
+
+;     Диск F: (электронный)
+DPH5: DW 0000H,0000H
+      DW 0000H,0000H
+      DW DIRBF,CPMT05
+      DW 0000H,ALL05
 
 ;======================  Таблицы описания дисков ===========================      
 ;      
@@ -4167,7 +4174,7 @@ CPMT03:
 ;     ДИСК  E: 
  
 TRNS03:
-;таблица параметров электронного диска-E
+;таблица параметров MOUNT-диска E
 CPMT04:
 
       DW 128 ; 128 байтовых секторов/трек ; SPT
@@ -4183,12 +4190,38 @@ CPMT04:
 ;==========================================
 
 
+;таблица параметров электронного диска F
+CPMT05:
 
+      DW 128 ; 128 байтовых секторов/трек ; SPT
+      DB 3   ; размер блока миним.кбайт   ; BSH
+      DB 7   ; число логических сек/блок  ; BLM
+      DB 00  ; extent mask                ; EXM
+      DW 143 ; обьем диска в блоках-1     ; DSM
+      DW 31  ; входов в директорий-1      ; DRM
+      DB 128 ; alloc 0                    ; AL0
+      DB 0   ; alloc 1                    ; AL1
+      DW 00  ; check size                 ; CKS
+      DW 00  ; число системных дорожек    ; OFS
+;==========================================
 
+;-------------------------------------
+;  Таблица адресов полей DRVMASK 
+DRVMASKTBL:
+      DW  CPMT00-2
+      DW  CPMT01-2
+      DW  CPMT02-2
+      DW  CPMT03-2
 
-SISNON:		;DAEE 
+; Сообщение при начальной загрузке
+
+SISNON:		
  	DB	0DH,0AH,'CP/M-80  vers. 2.2 ',0DH,0AH
 	DB	'EXTROM disk emulation BIOS v1.02 ',0DH,0AH,0
+
+;*************************************************
+;*   Точка входа холодной загрузки системы
+;*************************************************
 BOOT:
 	 DI		; Запрет прерываний
 	 LD	 SP,80H	; Setup stack space
@@ -4405,6 +4438,11 @@ SELDSK:
 	 CP	 0FFh		; FF - запрос адреса таблицы векторов
 	 LD	 HL,DOINT0
 	 RZ            		; Да - отдаем таблицу и на выход
+
+	 CP      0FEh 		; FE - вернуть таблицу масок выбора устройств
+	 LD	 HL,DRVMASKTBL
+	 RZ            		; Да - отдаем таблицу и на выход
+
 	 CP	 DRNUM		; Проверяем номер устройства - не более DRNUM
 	 JP      NC,DSERR	; Ошибка - слишком большой #
 ; определяем адрес таблицы
@@ -4416,15 +4454,15 @@ SELDSK:
 	 LD 	 A,(HL)
 	 INC	 HL
 	 LD 	 H,(HL)
-	 LD 	 L,A		;NL = DRH
+	 LD 	 L,A		;HL = DPB выбранного диска
 	 OR	 H
-	 JP 	 Z,DSERR	; > 5  (HL = 00 )
+	 JP 	 Z,DSERR	; Ошибка - DPB данного диска не определен
 	 LD 	 A,C
 	 CP	 4
-	 RET 	 NC		; Это не FDD а электронный диск - параметры фиксированны
+	 RET 	 NC		; Это не FDD а электронный или MOUNT-диск  - параметры фиксированны
 	 PUSH	 HL		; сохранить адрес таблицы DPH 
 	 LD	 BC,10
-	 ADD 	 HL,BC		;Адрес вектора таблици
+	 ADD 	 HL,BC		;Адрес вектора таблицы
 	 LD 	 A,(HL)
 	 INC	 HL
 	 LD 	 H,(HL)
@@ -4440,7 +4478,7 @@ SELDSK:
 DSERR:
 	 LD	 HL,0000	; если ошибка, вернем 0
 	 XOR	 A
-	 LD	 (CDISK),A	; если ошибка, драйв А:
+	 LD	 (CDISK),A	; если ошибка, устройстово А:
 	 RET
 
 	; таблица адресов дисковых таблиц
@@ -4449,10 +4487,10 @@ DRVTAB:
 	 DW  DPH1 ; B 1
 	 DW  DPH2 ; C 2 
 	 DW  DPH3 ; D 3
-	 DW  DPH4 ; E 4		Электронный
-	 DW  0    ; F 5
+	 DW  DPH4 ; E 4  MOUNT
+	 DW  DPH5 ; F 5  Электронный
 	 DW  0    ; G 6
-	 DW  0    ; H 7		HARD
+	 DW  0    ; H 7		
 
 ;*******************************************************************
 ;*        Функция 11 - SETSEC
@@ -4485,8 +4523,10 @@ READ:
 	LD 	A,4		;Режим чтения
 	LD 	(OPER),A
 	LD 	A,(DSKCPM) 	; выбранный диск
-	CP	4
-	JP 	Z,EDISK		; 4 - рамдиск
+	CP	5
+	JP 	Z,EDISK		; 5 - рамдиск
+	CP	4		; 
+	JP	Z,EMUREAD	; 4 - Mount-диск, физическим не бывает
 	LD	HL,(CPMT)	; адрес маски выбора
 	LD	A,(HL)
 	OR	A		; диски А или В ?
@@ -4496,14 +4536,10 @@ READ:
 ;  Чтение с эмулируемых дисков
 ;----------------------------------
 
-;	LD	HL,(CPMT)	; Адрес табл. параметров
-;	PUSH	HL
-;	CALL	FLUSH		;Проверка смены диска
-;	POP	HL
-;	LD	(CPMT),HL
 
 ; формируем командный пакет
 ;
+EMUREAD:
 	LD 	A,(DSKCPM) 	; выбранный диск
 	LD	(EXR_DRV),A	; # устройства
 	LD	A,(TRKCPM)	
@@ -4529,7 +4565,7 @@ READ_FDD:
 	OR	A
 	JP 	NZ,READ1
 READ0:
-	LD	HL,DREGWR ;HL = адрес хр-ия # тек. драйвера
+	LD	HL,DREGWR ;HL = адрес хр-ия # тек. устройстова
 	CALL	ETR1
 	JP 	Z,READ2
 READ1:
@@ -4730,8 +4766,8 @@ ETRAK:
 	 DB	0C0H,46H
 ETR1:
 	LD	A,(DSKCPM) 	;# дисковода для BDOS
-	CP	(HL)	;Сравнить с тек.# драйвера
-	RET NZ; # драйвера не соотв.# диска
+	CP	(HL)	;Сравнить с тек.# устройства
+	RET NZ; # устройства не соотв.# диска
 	INC	HL
 	LD	A,(TRKCPM) 	;Читать # трека
 	SUB	M
@@ -4776,16 +4812,21 @@ WRITE:
 	LD	(WRTYPE),A	; тип записи
 				; 0 - обычная   1 - в каталог   2 - в новый блок
 	LD	A,(DSKCPM) 
-	CP	4
-	JP 	Z,EDISK		;RAM-диск
+
+	CP	5
+	JP 	Z,EDISK		; 5 - рамдиск
+	CP	4		; 
+	JP	Z,EMUWRITE	; 4 - Mount-диск, физическим не бывает
+
 	LD	HL,(CPMT)	; адрес маски выбора диска
 	LD	A,(HL)
-	OR	A		; диски А или В ?
+	OR	A		; эмулируемые диски
 	JP	NZ,WRITE_FDD	; нет - это реальные дисководы
 ;
 ;  Запись на эмулируемый диск
 ;
 ; Формируем командный пакет	
+EMUWRITE:
 	LD	A,(DSKCPM) 
 	LD	(EXR_DRV),A
 	LD	A,(TRKCPM)
@@ -4924,7 +4965,7 @@ FLUS2:
 	LD	HL,SECSEK  ;Тек.# сектора
 	LD 	A,(HL)
 	INC	(HL)	;Следующий # сектора
-	LD	HL,(CPMT)	;Адрес драйвера
+	LD	HL,(CPMT)	;Адрес устройства
 	LD	DE,0FFFCH ;Обр.код (0002)
 	ADD HL,DE	;минус 2
 	CP	(HL)	; сектор/трек
@@ -6085,7 +6126,7 @@ DZIDE:
 	LD	(SECSEK),A	;
 	RET
 SIDE10:
-	LD	A,(DREG) 	;# текущего драйвера
+	LD	A,(DREG) 	;# текущего устройства
 	OR	SIDE1
 	LD	(DREG),A
 	RET
