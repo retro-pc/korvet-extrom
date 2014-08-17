@@ -156,7 +156,7 @@ drive_roflag[0]=0;
 drive_roflag[1]=0;  // снимаем защиту от записи
 drive_roflag[2]=0;
 drive_roflag[3]=0;
-drive_roflag[4]=0;
+drive_roflag[4]=1;  // диск Е по умолчанию защищен!
 }
 
 byte ext_rom_read(unsigned char PPI3_B, unsigned char PPI3_C) {
@@ -515,7 +515,14 @@ void emu_api_cmd(void) {
       in_buffer_size=0;
       break;
     }
-      
+
+    case 0x88: { // Снятие защиты записи с диска Е
+      add_to_out_buf(EMU_API_OK);
+      drive_roflag[4]=0;
+      in_buffer_size=0;
+      break;
+    }
+       
     case 0xA0: {  // --------- включение-отключение подстановки системных дорожек
       if (e_drv == 0) { 
         add_to_out_buf(EMU_API_OK);
