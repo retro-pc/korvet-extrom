@@ -1,0 +1,19 @@
+_BIOS_21_EXTROM:
+
+; 		  DB	 "EXTROMBIOSV1"
+	db 	pW_CHK_PATCH
+	dw 	0xDA33+ 0,0x5845,0x5845
+	db 	pW_CHK_PATCH
+	dw 	0xDA33+ 2,0x5254,0x5254
+	db 	pW_CHK_PATCH
+	dw 	0xDA33+ 4,0x4D4F,0x4D4F
+	db 	pW_CHK_PATCH
+	dw 	0xDA33+ 6,0x4942,0x4942
+	db 	pW_CHK_PATCH
+	dw 	0xDA33+ 8,0x534F,0x534F
+	db 	pW_CHK_PATCH
+	dw 	0xDA33+10,0x3156,0x3156	
+
+	db 	p_STOP
+
+	db 	'21_EXTROM',0

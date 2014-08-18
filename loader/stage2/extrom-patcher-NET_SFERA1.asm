@@ -1,0 +1,26 @@
+_CPM_NET_SFERA1:
+
+	;chk only
+	db 	pW_CHK_PATCH
+	dw 	0xC380,0xC380,0xC380 	
+	db 	pW_CHK_PATCH
+	dw 	0xC382,0xDa00,0xDa00
+	db 	pW_CHK_PATCH
+	dw 	0xC384,0x000A,0x000A
+
+	db 	pW_CHK_PATCH
+	dw 	0xDB5C+1,0xDAC3,0xDAC3 ; HELLO MSG 	
+	db 	pW_CHK_PATCH
+	dw 	0xDA03+1,0xDB6E,0xDB6E
+	db 	pW_CHK_PATCH
+	dw 	0xDA27+1,0xDED4,0xDED4
+	db 	pW_CHK_PATCH
+	dw 	0xDA2A+1,0xE193,0xE193
+	db 	pW_CHK_PATCH
+	dw 	0xDA3C+1,0xDD06,0xDD06
+
+	db 	pNotSupported
+
+	db 	p_STOP
+	db 	'CPM_NET_SFERA1',0
+
