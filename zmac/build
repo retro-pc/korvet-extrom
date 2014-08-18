@@ -1,0 +1,5 @@
+#/bin/sh
+gcc -o doc -DMK_DOC doc.c
+./doc 
+bison --output=zmac.c zmac.y
+gcc -s -o zmac -DMSDOS zmac.c mio.c doc.c zi80dis.cpp
