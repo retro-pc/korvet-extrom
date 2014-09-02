@@ -10,9 +10,11 @@ COMMON = -mmcu=$(MCU)
 
 ## Compile options common for all C compilation units.
 CFLAGS = $(COMMON) -Wunused
-#CFLAGS += -gdwarf-2 -Os -std=gnu99 -funsigned-char -funsigned-bitfields -fpack-struct -fshort-enums -g
 CFLAGS += -gdwarf-2 -O2 -std=gnu99 -funsigned-char -funsigned-bitfields -fpack-struct -fshort-enums -g
 CFLAGS += -MD -MP -MT $(*F).o -MF dep/$(@F).d 
+ifeq ($(LOWSPEED),1)
+  CFLAGS += -DLOWSPEED
+endif
 
 ## Assembly specific flags
 ASMFLAGS = $(COMMON)
