@@ -80,10 +80,6 @@ File fcb[6];     // описатели всех доступных файлов
 File* fs_file;   // указатель на текущий открытый файл
 int fnum;        // номер описател€ текущего обрабатываемого файла      
 
-#ifndef FS_DISABLE_SWAP
-//File fs_secondFile;
-#endif
-
 /* —труктура boot-сектора */
 
 #define BPB_SecPerClus    13
