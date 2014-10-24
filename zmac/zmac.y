@@ -1,6 +1,6 @@
 %{
 // GWP - keep track of version via hand-maintained date stamp.
-#define VERSION "19sep2013"
+#define VERSION "22jul2014"
 
 /*
  *  zmac -- macro cross-assembler for the Zilog Z80 microprocessor
@@ -129,6 +129,32 @@
  *		Free-form title, name, comment, subttl parsing.  Allow #arg
  *		for macro arguments (in --mras mode).  Support <CR> delimited
  *		files.  Add .ams output.  Integrate documentation (--doc).
+ *
+ * emit jr even if out of range
+ * z80.lib support
+ * warning and bug fixes from Mark Galanger
+ * macros can override built-ins and are no longer listed in symbol table
+ * A, B, C, D, E, H, L, M, PSW, SP pre-defined values which can be used
+ * in data statements (db, dw, dd).  Reserved words can be equated but
+ * only accessbile in data.
+ * SET can be used in place of DEFL (MAC, MACRO-80 agree on this)
+ * '=' can be used in place of EQU.
+ * 'maclib file' includes 'file.lib'.  Bug fix in "dw 0,$".
+ * Removed error flagging in expressions which could cause parse to fail
+ * from that point onwards.
+ * expression(ix) equivalent to (ix + expression).
+ * macro expanded lines didn't go through the line analyzer.
+ * empty macro arguments (e.g., mac 1,,2)
+ * rept, irp, irpc, exitm
+ * detail on phase errors
+ * '' is an empty string in db/ascii/etc, 0 otherwise.
+ * Almost any name can be used as a macro parameter name.
+ * Allow 'if' in first column.
+ * Fix .rel mode bug in dc, incbin.
+ * Emit .bds output for dc, incbin.
+ * Allow assembly wrap past end of memory.
+ * "pragma bds" and output equates to .bds file.
+ * 
  */
 
 #define MIO		/* use emulation routines from mio.c */
@@ -138,6 +164,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #ifdef WIN32
 #include <windows.h>	// just for colouring the output
@@ -150,6 +177,8 @@
 #endif
 
 #ifdef MIO
+#include "mio.h"
+
 FILE *mfopen();
 #else
 #define mfopen(filename,mode) fopen(filename,mode)
@@ -163,13 +192,19 @@ FILE *mfopen();
 
 /*
  * DEBUG turns on pass reporting.
+ * DBUG enables -d to allow yacc/bison yydebug increment (but must be passed
+ *	on the command line)
  * Macro debug and Token debug enables.
 #define	DEBUG
 #define	M_DEBUG	
 #define	T_DEBUG
  */
 
-#define ITEMTABLESIZE	10000
+#ifdef DBUG
+#define YYDEBUG 1
+#endif
+
+#define ITEMTABLESIZE	100000
 #define TEMPBUFSIZE	(1000+MAXSYMBOLSIZE)
 #define LINEBUFFERSIZE	1000
 #define EMITBUFFERSIZE	200
@@ -186,9 +221,36 @@ FILE *mfopen();
 #define MAXPASS		32
 #define MAXINCPATH	32
 
+int iflist();
+int yylex();
+int phaseaddr(int addr);
+int nextchar();
+int getcol();
+int skipline(int ac);
+int tokenofitem(int deftoken, int keyexclude, int keyinclude);
+int getm();
+int counterr();
+int countwarn();
 
 void yyerror(char *err)
 {}		/* we will do our own error printing */
+
+struct argparse {
+	char *arg;	// output buffer for argument
+	int argsize;	// size of output buffer
+	int (*getch)(struct argparse *); // get next character
+	int *peek;	// pointer single item pushback buffer
+	int macarg;	// working on macro arguments
+
+	char *user_ptr;	// state for getch
+	int user_int;	// state for getch
+	int user_peek;	// state for getch
+
+	int didarg;	// internal parsing state
+	int numarg;	// internal parsing state
+};
+
+int getarg(struct argparse *ap);
 
 struct	item	{
 	char	*i_string;
@@ -199,12 +261,16 @@ struct	item	{
 	int	i_chain;
 };
 
+void itemcpy(struct item *dst, struct item *src);
+struct item *keyword(char *name);
+
 #define SCOPE_NONE	(0)
 #define SCOPE_PROGRAM	(1)
 #define SCOPE_DATA	(2)
 #define SCOPE_PUBLIC	(4)
 #define SCOPE_EXTERNAL	(8)
 #define SCOPE_NORELOC	(16)
+#define SCOPE_BUILTIN	(32)	/* abuse */
 
 #define SCOPE_SEGMASK	(3)
 #define SCOPE_SEG(s)	((s) & SCOPE_SEGMASK)
@@ -252,6 +318,10 @@ int	note_depend;	// Print names of files included
 int	firstcol;
 int	logcol;
 int	coloncnt;
+int	full_exprs;	// expression parsing mode allowing almost any identifier
+struct item *label, pristine_label; // 
+int	list_dollarsign;// flag used to change list output for some operations
+int	list_addr;	// address to display for operation if !list_dollarsign
 
 // Include file search path
 char	*incpath[MAXINCPATH];
@@ -265,7 +335,7 @@ int	linein[NEST_IN] ;
 int	now_in ;
 
 
-// These first 5 errors are singled out in listerr1() for reasons I don't
+// These first 5 errors are singled out in lsterr1() for reasons I don't
 // quite understand.
 #define bflag	0	/* balance error */
 #define eflag	1	/* expression error */
@@ -286,12 +356,13 @@ int	now_in ;
 #define FIRSTWARN	warn_hex
 #define	warn_hex	14
 #define warn_notimpl	15
+#define warn_general	16
 
-#define FLAGS	16	/* number of errors and warnings */
+#define FLAGS	17	/* number of errors and warnings */
 
 char	err[FLAGS];
 int	keeperr[FLAGS];
-char	errlet[FLAGS]="BEFIMPUVOAJRGZHN";
+char	errlet[FLAGS]="BEFIMPUVOAJRGZHNW";
 char	*errname[FLAGS]={
 	"Balance",
 	"Expression",
@@ -308,8 +379,11 @@ char	*errname[FLAGS]={
 	"Register usage",
 	"Z-80 instruction in 8080 mode",
 	"$hex constant interpreted as symbol",
-	"Not implemented"
+	"Not implemented",
+	"General"
 };
+char	errdetail[FLAGS][1024];
+char	detail[1024];
 
 
 unsigned char inpbuf[LINEBUFFERSIZE];
@@ -326,17 +400,13 @@ char	*outbinm = outbin+BINPERLINE;
 char	outoth[256];
 int	outoth_cnt = 0;
 
-char	emitbuf[EMITBUFFERSIZE];
-char	*emitptr;
+unsigned char	emitbuf[EMITBUFFERSIZE];
+unsigned char	*emitptr;
 
 char	ifstack[IFSTACKSIZE];
 char	*ifptr;
 char	*ifstmax = ifstack+IFSTACKSIZE-1;
 
-
-char	expif[MAXIFS];
-char	*expifp;
-char	*expifmax = expif+MAXIFS;
 
 char	hexadec[] = "0123456789ABCDEF" ;
 
@@ -352,19 +422,39 @@ int	njrpromo;
 char	tempbuf[TEMPBUFSIZE];
 char	*tempmax = tempbuf+TEMPBUFSIZE-1;
 
-char	inmlex;
 char	arg_flag;
+struct argparse arg_state;
+void	arg_start();
+void	arg_reset();
+int	str_getch(struct argparse *ap);
+
+char	inmlex;
+char	mlex_list_on;
 int	parm_number;
 int	exp_number;
 char	symlong[] = "Symbol/number too long";
 int	raw;
 
 int	disp;
+
+int	param_parse;
+#define PARAMTABSIZE (PARMMAX * 2)
+struct item paramtab[PARAMTABSIZE];
+
 #define FLOC	PARMMAX
 #define TEMPNUM	PARMMAX+1
+#define REPNUM	PARMMAX+2
+#define MSTART	PARMMAX+3
+#define MSTR	PARMMAX+4
+#define MARGP	PARMMAX+5
+#define MIF	PARMMAX+6
+
+#define PAREXT	7
+
 union exprec {
 	char *param;
 	int value;
+	struct argparse *ap;
 };
 union exprec	*est;
 union exprec	*est2;
@@ -469,6 +559,7 @@ void putrelop(int op);
 #define RELOP_MUL	(9)
 #define RELOP_DIV	(10)
 #define RELOP_MOD	(11)
+struct item *item_lookup(char *name, struct item *table, int table_size);
 struct item *locate(char *name);
 // Data descriptions for emit()
 #define E_CODE		(0)
@@ -476,6 +567,7 @@ struct item *locate(char *name);
 #define E_CODE8		(2)
 #define E_CODE16	(3)
 int segment;
+#define SEGCHAR(s) " '\"!"[s]
 #define SEG_ABS		(0)
 #define SEG_CODE	(1)
 #define SEG_DATA	(2)
@@ -483,6 +575,11 @@ int seg_pos[4]; // may eventually support SEG_COMMON
 int seg_size[4];
 int rel_main;
 int segchange;
+void putout(int value);
+int outrec;
+int outlen;
+unsigned char outbuf[1024 * 1024];
+
 
 /*
  *  push back character
@@ -496,6 +593,7 @@ void usage(char *msg, char *param);
 void help();
 void erreport();
 void errorprt(int errnum);
+void errwarn(int errnum, char *message);
 void mlex(char *look);
 void popsi();
 void suffix(char *str, char *suff);
@@ -506,6 +604,7 @@ void casname(char *out, char *src);
 void putm(int c);
 void insymtab(char *name);
 void outsymtab(char *name);
+void compactsymtab();
 void putsymtab();
 void clear();
 void setmem(int addr, int value, int type);
@@ -549,17 +648,14 @@ char *getmraslocal();
 /*
  *  add a character to the output line buffer
  */
-int addtoline(int ac)
+void addtoline(int ac)
 {
 	/* check for EOF from stdio */
 	if (ac == -1)
 		ac = 0 ;
-	if (inmlex)
-		return(ac);
 	if (lineptr >= linemax)
 		error("line buffer overflow");
 	*lineptr++ = ac;
-	return(ac);
 }
 
 /*
@@ -578,8 +674,10 @@ void emit(int bytes, int desc, struct expr *data, ...)
 	}
 
 	// External references only supported in .rel output.
-	if (!relopt && data && (data->e_scope & SCOPE_EXTERNAL))
-		err[uflag]++;
+	if (!relopt && data && (data->e_scope & SCOPE_EXTERNAL)) {
+		sprintf(detail, "External references only allowed in .rel output\n");
+		errwarn(uflag, detail);
+	}
 
 	va_start(ap, data);
 
@@ -610,6 +708,7 @@ void emit(int bytes, int desc, struct expr *data, ...)
 			if (segment == SEG_CODE) 
 				setmem(addr, *emitptr, type);
 			putrel(*emitptr);
+			putout(*emitptr);
 			emitptr++;
 		}
 	}
@@ -621,10 +720,9 @@ void emit(int bytes, int desc, struct expr *data, ...)
 		*emitptr = data->e_value >> (i * 8);
 		if (segment == SEG_CODE)
 			setmem(addr, *emitptr, type);
+		putout(*emitptr);
 		emitptr++;
 	}
-
-	advance_segment(args + dsize);
 
 	if (desc != E_DATA)
 	{
@@ -881,7 +979,11 @@ void emitjr(int opcode, struct expr *dest)
 		err[rflag]++;
 
 	// Can't relative jump to other segments or an external
-	if (((dest->e_scope & (SCOPE_SEGMASK | SCOPE_EXTERNAL)) != segment ||
+	// However, without .rel output we default to the code segment
+	// for various reasons thus we let "jr 0" (and such) be acceptable
+	// in those cases.
+	if (((relopt && (dest->e_scope & SCOPE_SEGMASK) != segment) ||
+		(dest->e_scope & SCOPE_EXTERNAL) ||
 		disp > 127 || disp < -128) && z80)
 	{
 		if (jopt) {
@@ -912,6 +1014,7 @@ void emitjr(int opcode, struct expr *dest)
 			}
 		}
 		else {
+			emit(2, E_CODE, 0, opcode, -2);  // branch to itself
 			err[vflag]++;
 			expr_free(dest);
 		}
@@ -992,6 +1095,23 @@ void puthex(int byte, FILE *buf)
 	putc(hexadec[byte & 017], buf);
 }
 
+// Case-independent strcmp()
+
+int ci_strcmp(char *s1, char *s2)
+{
+	int c1, c2;
+	do {
+		c1 = *s1++;
+		if (c1 >= 'A' && c1 <= 'Z') c1 += 'a' - 'A';
+		c2 = *s2++;
+		if (c2 >= 'A' && c2 <= 'Z') c2 += 'a' - 'A';
+		if (c1 != c2)
+			return c1 - c2;
+	} while (c1 && c2);
+
+	return 0;
+}
+
 void flushoth()
 {
 	int i, checksum;
@@ -1042,7 +1162,7 @@ void casname(char *out, char *src)
 		out[i] = ' ';
 
 	for (i = 0; *base && i < 6; base++) {
-		if (strcmp(base, ".z") == 0 || strcmp(base, ".Z") == 0)
+		if (ci_strcmp(base, ".z") == 0)
 			break;
 
 		if (*base >= 'a' && *base <= 'z') {
@@ -1134,7 +1254,7 @@ void flushrel(void)
  */
 void list(int optarg)
 {
-	char *	p;
+	unsigned char *	p;
 	int	i;
 	int  lst;
 	char seg = ' ';
@@ -1184,7 +1304,7 @@ void list(int optarg)
 			puthex(optarg >> 8, fout);
 			puthex(optarg, fout);
 			if (relopt)
-				seg = " '\"!"[segment];
+				seg = SEGCHAR(segment);
 			fputc(seg, fout);
 			fputc(' ', fout);
 			for (p = emitbuf; (p < emitptr) && (p - emitbuf < 4); p++) {
@@ -1198,10 +1318,12 @@ void list(int optarg)
 		}
 
 		if (bopt) {
-			fprintf(fbds, "%04x %04x d ", dollarsign, emit_addr);
-			for (p = emitbuf; p < emitptr; p++)
-				fprintf(fbds, "%02x", *p & 0xff);
-			fprintf(fbds, "\n");
+			if (emitptr > emitbuf) {
+				fprintf(fbds, "%04x %04x d ", dollarsign, emit_addr);
+				for (p = emitbuf; p < emitptr; p++)
+					fprintf(fbds, "%02x", *p & 0xff);
+				fprintf(fbds, "\n");
+			}
 			fprintf(fbds, "%04x %04x s %s", dollarsign, emit_addr, linebuf);
 
 			for (p = emitbuf; p < emitptr; p++)
@@ -1224,11 +1346,13 @@ void list(int optarg)
 		lsterr2(lst);
 	} else
 		lsterr1();
+
 	dollarsign += emitptr - emitbuf;
 	emit_addr += emitptr - emitbuf;
+	dollarsign &= 0xffff;
+	emit_addr &= 0xffff;
 	emitptr = emitbuf;
 	lineptr = linebuf;
-	advance_segment(emitptr - emitbuf);
 }
 
 
@@ -1319,10 +1443,15 @@ void lsterr2(int lst)
 			if (i < FIRSTWARN)
 				passfail = 1;
 			if (lst) {
+				char *desc = errname[i];
+				char *type = i < FIRSTWARN ? " error" : " warning";
+				if (errdetail[i][0]) {
+					desc = errdetail[i];
+					type = "";
+				}
 				lineout();
-				fprintf(fout, "%c %s %s\n",
-					errlet[i], errname[i],
-					i < FIRSTWARN ? "error" : "warning");
+				fprintf(fout, "%c %s%s\n",
+					errlet[i], desc, type);
 			}
 			err[i] = 0;
 			keeperr[i]++;
@@ -1338,11 +1467,26 @@ void lsterr2(int lst)
  */
 void errorprt(int errnum)
 {
-	fprintf(stderr,"%s(%d) : %s %s\n%s\n",
-		src_name[now_in], linein[now_in], errname[errnum],
-			errnum < FIRSTWARN ? "error" : "warning", linebuf) ;
+	char *desc = errname[errnum];
+	char *type = errnum < FIRSTWARN ? " error" : " warning";
+	if (errdetail[errnum][0]) {
+		desc = errdetail[errnum];
+		type = "";
+	}
+	fprintf(stderr, "%s(%d) : %s%s",
+		src_name[now_in], linein[now_in], desc, type);
+
+	errdetail[errnum][0] = '\0';
+
+	fprintf(stderr, "\n");
+	fprintf(stderr, "%s\n", linebuf);
 	fflush(stderr) ;
-	return ;
+}
+
+void errwarn(int errnum, char *message)
+{
+	err[errnum]++;
+	strcpy(errdetail[errnum], message);
 }
 
 
@@ -1357,7 +1501,7 @@ void list1()
 	lineptr = linebuf;
 	if (!expptr) linecnt++;
 	if (outpass) {
-		if (lst = iflist()) {
+		if ((lst = iflist())) {
 			lineout();
 			if (nopt)
 				fprintf(fout, "%4d:\t", linein[now_in]);
@@ -1381,6 +1525,9 @@ int iflist()
 {
 	int i, j;
 
+	if (inmlex)
+		return mlex_list_on;
+
 	if (lston)
 		return(1) ;
 	if (lopt)
@@ -1400,6 +1547,9 @@ int iflist()
 	return(0);
 }
 
+void do_equ(struct item *sym, struct expr *val, int call_list);
+void do_defl(struct item *sym, struct expr *val, int call_list);
+
 // GWP - This avoids an apparent bug in bison as it tries to start out the
 // Not needed under gcc which defines __STDC__ so I guard it to prevent
 // warnings.
@@ -1412,11 +1562,13 @@ int iflist()
 #define PSRSYM	(1)	/* rsym */
 #define PSWSYM	(2)	/* wsym */
 #define PSINC	(3)	/* include file */
+#define PSMACLIB (4)	/* maclib (similar to include) */
 
 #define SPTITL	(0)	/* title */
 #define SPSBTL	(1)	/* sub title */
 #define SPNAME	(2)	/* name */
 #define SPCOM	(3)	/* comment */
+#define SPPRAGMA (4)	/* pragma */
 
 %}
 
@@ -1509,10 +1661,8 @@ int iflist()
 %token <itemptr> MINMAX
 %token MACRO
 %token <itemptr> MNAME
-%token <itemptr> OLDMNAME
 %token ARG
 %token ENDM
-%token MPARM
 %token <ival> ONECHAR
 %token <ival> TWOCHAR
 %token JRPROMOTE
@@ -1525,6 +1675,13 @@ int iflist()
 %token <itemptr> INXDCX INRDCR PSW JUMP8 JP CALL8 ALUI8
 %token <itemptr> SPECIAL
 %token RAWTOKEN LOCAL
+// New token types for ZNONSTD support
+%token <itemptr> LD_XY ST_XY MV_XY ALU_XY BIT_XY SHIFT_XY INP OUTP JR_COND
+%token <itemptr> LDST16 ARITH16
+// Tokens for improved macro support
+%token REPT IRPC IRP EXITM
+%token NUL
+%token <itemptr> MPARM
 
 %type <itemptr> label.part symbol
 %type <ival> allreg reg evenreg ixylhreg realreg mem memxy pushable bcdesp bcdehlsp mar condition
@@ -1532,6 +1689,8 @@ int iflist()
 %type <exprptr> noparenexpr parenexpr expression lxexpression
 %type <ival> maybecolon maybeocto
 %type <ival> evenreg8 reg8 m pushable8
+// Types for improved macro support
+%type <cval> locals
 
 %right '?' ':'
 %left OROR
@@ -1549,6 +1708,67 @@ int iflist()
 %{
 char  *cp;
 int  i;
+
+void do_equ(struct item *sym, struct expr *val, int call_list)
+{
+	expr_reloc_check(val);
+	switch(sym->i_token) {
+	case UNDECLARED: case WASEQUATED:
+		if (sym->i_token == WASEQUATED &&
+			(sym->i_value != val->e_value ||
+			 ((sym->i_scope ^ val->e_scope) & SCOPE_SEGMASK)))
+		{
+			if (outpass) {
+				if (sym->i_value != val->e_value)
+					sprintf(detail, "%s error - %s went from $%04x to $%04x",
+						errname[pflag], sym->i_string, sym->i_value, val->e_value);
+				else
+					sprintf(detail, "%s error - %s changed scope",
+						errname[pflag], sym->i_string);
+				errwarn(pflag, detail);
+			}
+			else
+				passretry = 1;
+		}
+
+		sym->i_token = EQUATED;
+		sym->i_value = val->e_value;
+		sym->i_scope |= val->e_scope;
+		break;
+	default:
+		// m80 allows multiple equates as long as the value
+		// does not change.  So does newer zmac.
+		if (sym->i_value != val->e_value ||
+			((sym->i_scope ^ val->e_scope) & SCOPE_SEGMASK))
+		{
+			err[mflag]++;
+			sym->i_token = MULTDEF;
+		}
+	}
+	sym->i_scope &= ~SCOPE_BUILTIN;
+	if (call_list)
+		list(val->e_value);
+	expr_free(val);
+}
+
+void do_defl(struct item *sym, struct expr *val, int call_list)
+{
+	expr_reloc_check(val);
+	switch(sym->i_token) {
+	case UNDECLARED: case DEFLED:
+		sym->i_token = DEFLED;
+		sym->i_value = val->e_value;
+		sym->i_scope = (sym->i_scope & SCOPE_SEGMASK) | val->e_scope;
+		break;
+	default:
+		err[mflag]++;
+		sym->i_token = MULTDEF;
+	}
+	if (call_list)
+		list(val->e_value);
+	expr_free(val);
+}
+
 %}
 
 %%
@@ -1578,57 +1798,20 @@ statement:
 		else  list1();
 	}
 |
-	label.part operation '\n' {
-		list(dollarsign);
+	label.part { list_dollarsign = 1; } operation '\n' {
+		list(list_dollarsign ? dollarsign : list_addr);
 	}
 |
 	symbol EQU expression '\n' {
-		expr_reloc_check($3);
-		switch($1->i_token) {
-		case UNDECLARED: case WASEQUATED:
-			if ($1->i_token == WASEQUATED &&
-				($1->i_value != $3->e_value ||
-				 (($1->i_scope ^ $3->e_scope) & SCOPE_SEGMASK)))
-			{
-				if (outpass)
-					err[pflag]++;
-				else
-					passretry = 1;
-			}
-
-			$1->i_token = EQUATED;
-			$1->i_value = $3->e_value;
-			$1->i_scope |= $3->e_scope;
-			break;
-		default:
-			// m80 allows multiple equates as long as the value
-			// does not change.  So does newer zmac.
-			if ($1->i_value != $3->e_value ||
-				(($1->i_scope ^ $3->e_scope) & SCOPE_SEGMASK))
-			{
-				err[mflag]++;
-				$1->i_token = MULTDEF;
-			}
-		}
-
-		list($3->e_value);
-		expr_free($3);
+		do_equ($1, $3, 1);
+	}
+|
+	symbol '=' expression '\n' {
+		do_equ($1, $3, 1); // TODO: is '=' equate or defl?
 	}
 |
 	symbol DEFL expression '\n' {
-		expr_reloc_check($3);
-		switch($1->i_token) {
-		case UNDECLARED: case DEFLED:
-			$1->i_token = DEFLED;
-			$1->i_value = $3->e_value;
-			$1->i_scope = ($1->i_scope & SCOPE_SEGMASK) | $3->e_scope;
-			break;
-		default:
-			err[mflag]++;
-			$1->i_token = MULTDEF;
-		}
-		list($3->e_value);
-		expr_free($3);
+		do_defl($1, $3, 1);
 	}
 |
 	symbol MINMAX expression ',' expression '\n' {
@@ -1658,17 +1841,9 @@ statement:
 		expr_number_check($2);
 		if (ifptr >= ifstmax)
 			error("Too many ifs");
-		else {
-			if (pass2) {
-				*++ifptr = *expifp++;
-				if (*ifptr != !($2->e_value)) err[pflag]++;
-			} else {
-				if (expifp >= expifmax)
-					error("Too many ifs!");
-				*expifp++ = !($2->e_value);
-				*++ifptr = !($2->e_value);
-			}
-		}
+		else
+			*++ifptr = !($2->e_value);
+
 		saveopt = fopt;
 		fopt = 1;
 		list($2->e_value);
@@ -1795,6 +1970,10 @@ statement:
 		case PSINC:	/* include file */
 			next_source(tempbuf) ;
 			break ;
+		case PSMACLIB:
+			strcat(tempbuf, ".lib");
+			next_source(tempbuf);
+			break;
 		}
 	}
 |
@@ -1808,7 +1987,7 @@ statement:
 		incbin(tempbuf);
 	}
 |
-	SPECIAL raw_on RAWTOKEN {
+	SPECIAL { raw = 1; } RAWTOKEN {
 		int quote = 0;
 		char *p, *q;
 		switch ($1->i_value) {
@@ -1852,6 +2031,13 @@ statement:
 					break;
 				}
 			}
+			break;
+
+		case SPPRAGMA:
+			if (strncmp(tempbuf, "bds", 3) == 0 && bopt && outpass) {
+				fprintf(fbds, "%s\n", tempbuf + 4);
+			}
+			list1();
 			break;
 		}
 	}
@@ -1958,53 +2144,36 @@ statement:
 		list1();
 	}
 |
-	UNDECLARED MACRO parm.list '\n' locals {
+	UNDECLARED MACRO { param_parse = 1; } parm.list '\n' {
+		param_parse = 0;
 		$1->i_token = MNAME;
 		$1->i_value = mfptr;
-#ifdef M_DEBUG
-		fprintf (stderr, "[UNDECLARED MACRO %s]\n", $1->i_string);
-#endif
-		mfseek(mfile, (long)mfptr, 0);
-		cp = 0;
-
-		// Because of locals the parser has to look ahead.
-		// We'll have buffered that as we usually do so just a
-		// matter of picking that up and cancelling any look-ahead.
-		*lineptr = '\0';
-		cp = strchr(linebuf, '\n');
-		if (cp) {
-			cp++;
-			peekc = -1;
+		if (keyword($1->i_string)) {
+			sprintf(detail, "Macro '%s' will override the built-in '%s'",
+				$1->i_string, $1->i_string);
+			errwarn(warn_general, detail);
 		}
-		yychar = YYEMPTY;
-
+#ifdef M_DEBUG
+		fprintf (stderr, "%s(%d) [UNDECLARED MACRO %s]\n",
+			src_name[now_in], linein[now_in], $1->i_string);
+#endif
 		list1();
-		mlex(cp);
+	}
+	locals {
+		mlex_list_on++;
+		mfseek(mfile, (long)mfptr, 0);
+		mlex($7);
+		mlex_list_on--;
 		parm_number = 0;
 	}
 |
-	OLDMNAME MACRO {
-		$1->i_token = MNAME;
+	label.part MNAME al { arg_state.macarg = 1; } arg.list '\n' {
 #ifdef M_DEBUG
-		fprintf (stderr, "[OLDNAME MACRO %s]\n", $1->i_string);
-#endif
-		while (yychar != ENDM && yychar) {
-			while (yychar != '\n' && yychar)
-				yychar = yylex();
-			list1();
-			yychar = yylex();
-		}
-		while (yychar != '\n' && yychar) yychar = yylex();
-		list1();
-		yychar = yylex();
-	}
-|
-	label.part MNAME al arg.list '\n' {
-#ifdef M_DEBUG
-		fprintf (stderr, "[MNAME %s]\n", $2->i_string);
+		fprintf (stderr, "%s(%d) [MNAME %s]\n",
+			src_name[now_in], linein[now_in], $2->i_string);
 #endif
 		$2->i_uses++ ;
-		arg_flag = 0;
+		arg_reset();
 		parm_number = 0;
 		list(dollarsign);
 		expptr++;
@@ -2012,14 +2181,128 @@ statement:
 		est2 = NULL; // GWP - this may leak, but it avoids double-free crashes
 		est[FLOC].value = floc;
 		est[TEMPNUM].value = exp_number++;
+		est[MIF].param = ifptr;
+		est[REPNUM].value = 0;
+		est[MSTR].param = NULL;
 		floc = $2->i_value;
 		mfseek(mfile, (long)floc, 0);
 	}
 |
+	label.part REPT expression al '\n' {
+		expr_reloc_check($3);
+		list1();
+		arg_reset();
+	}
+	locals {
+		int pos = mfptr;
+		mfseek(mfile, (long)mfptr, 0);
+		mlex($7);
+		parm_number = 0;
+
+		// MRAS compat would require treating the repeat count
+		// as a byte value with 0 == 256.
+		if ($3->e_value > 0) {
+			expptr++;
+			est = est2;
+			est2 = NULL;
+			est[FLOC].value = floc;
+			est[TEMPNUM].value = exp_number++;
+			est[MIF].param = ifptr;
+			est[REPNUM].value = $3->e_value - 1;
+			est[MSTART].value = pos;
+			est[MSTR].param = NULL;
+			floc = pos;
+			mfseek(mfile, (long)floc, 0);
+		}
+	}
+|
+	label.part IRPC parm.single ',' { parm_number = 0; } al arg.element arg_off '\n'
+	{
+		list1();
+	}
+	locals {
+		int pos = mfptr;
+
+		mfseek(mfile, (long)mfptr, 0);
+		mlex($11);
+
+		parm_number = 0;
+
+		if (est2[0].param[0]) {
+			expptr++;
+			est = est2;
+			est2 = NULL;
+			est[FLOC].value = floc;
+			est[TEMPNUM].value = exp_number++;
+			est[MIF].param = ifptr;
+			est[REPNUM].value = 0;
+			est[MSTART].value = pos;
+			est[MSTR].param = est[0].param;
+			est[0].param = malloc(2);
+			est[0].param[0] = est[MSTR].param[0];
+			est[0].param[1] = '\0';
+			floc = pos;
+			mfseek(mfile, (long)floc, 0);
+		}
+	}
+|
+	label.part IRP parm.single ',' { parm_number = 0; } al arg.element arg_off '\n'
+	{
+		list1();
+	}
+	locals {
+		int pos = mfptr;
+		mfseek(mfile, (long)mfptr, 0);
+		mlex($11);
+
+		parm_number = 0;
+		// if the sub list is not empty
+		if (est2[0].param[0] && est2[0].param[0] != ';'
+			&& est2[0].param[0] != '\n')
+		{
+			expptr++;
+			est = est2;
+			est2 = NULL;
+			est[FLOC].value = floc;
+			est[TEMPNUM].value = exp_number++;
+			est[MIF].param = ifptr;
+			est[REPNUM].value = -1;
+			est[MSTART].value = pos;
+			est[MSTR].param = NULL;
+
+			est[MARGP].ap = malloc(sizeof *est[MARGP].ap);
+			est[MARGP].ap->arg = malloc(TEMPBUFSIZE);
+			est[MARGP].ap->argsize = TEMPBUFSIZE;
+			est[MARGP].ap->getch = str_getch;
+			est[MARGP].ap->user_ptr = est[0].param;
+			est[MARGP].ap->user_int = 0;
+			est[MARGP].ap->user_peek = -1;
+			est[MARGP].ap->peek = &est[MARGP].ap->user_peek;
+			est[MARGP].ap->macarg = 0;
+			est[MARGP].ap->didarg = 0;
+			est[MARGP].ap->numarg = 0;
+
+			est[0].param = est[MARGP].ap->arg;
+			getarg(est[MARGP].ap);
+
+			floc = pos;
+			mfseek(mfile, (long)floc, 0);
+		}
+	}
+|
+	label.part EXITM '\n' {
+		// XXX - popsi() is not safe, There is type-specific cleanup.
+		//  But for now...
+		// popsi() must be made safe as others use it.
+		list1();
+		popsi();
+	}
+|
 	error {
 		err[fflag]++;
-		arg_flag = 0;
+		arg_reset();
 		parm_number = 0;
+		param_parse = 0;
 
 		if (est2)
 		{
@@ -2052,10 +2335,12 @@ maybecolon:
 
 label.part:
 	/*empty*/
-	 {	$$ = NULL;	}
+	 {	label = $$ = NULL;	}
 |
 	symbol maybecolon {
 		coloncnt = $2;
+		itemcpy(&pristine_label, $1);
+		label = coloncnt == 0 ? $1 : NULL;
 		$1->i_scope |= segment;
 		if ($2 == 2)
 			$1->i_scope |= SCOPE_PUBLIC;
@@ -2065,8 +2350,11 @@ label.part:
 
 		switch($1->i_token) {
 		case UNDECLARED:
-			if (pass2)
-				err[pflag]++;
+			if (pass2) {
+				sprintf(detail, "%s error - label '%s' not declared",
+					errname[pflag], $1->i_string);
+				errwarn(pflag, detail);
+			}
 			else {
 				$1->i_token = LABEL;
 				$1->i_value = dollarsign;
@@ -2079,8 +2367,11 @@ label.part:
 			} else if ($1->i_value != dollarsign) {
 				// XXX - perhaps only allow retrys if JR promotions are in play?
 				if (outpass) {
-					if (!passfail)
-						err[pflag]++;
+					if (!passfail) {
+						sprintf(detail, "%s error - label '%s' changed from $%04x to $%04x",
+							errname[pflag], $1->i_string, $1->i_value, dollarsign);
+						errwarn(pflag, detail);
+					}
 				}
 				else {
 					$1->i_value = dollarsign;
@@ -2106,7 +2397,8 @@ public.part:
 		$1->i_scope |= SCOPE_PUBLIC;
 		if (pass2) {
 			if ($1->i_token == UNDECLARED) {
-				err[uflag]++;
+				sprintf(detail, "'%s' %s", $1->i_string, errname[uflag]);
+				errwarn(uflag, detail);
 			}
 		}
 	}
@@ -2183,6 +2475,11 @@ operation:
 |
 	ALUI8 expression
 		{ emit1($1->i_value, 0, $2, ET_BYTE); }
+|
+	ALU_XY dxy
+		{
+			emit(3, E_CODE, 0, $1->i_value >> 8, $1->i_value, disp);
+		}
 |
 	ADD expression
 		{ emit1(0306, 0, $2, ET_BYTE); }
@@ -2273,6 +2570,11 @@ operation:
 	SHIFT reg
 		{ emit1(0145400 + ($1->i_value << 3) + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
 |
+	SHIFT_XY dxy
+		{
+			emit(4, E_CODE, 0, $1->i_value >> 8, 0xcb, disp, $1->i_value);
+		}
+|
 	SHIFT memxy ',' realreg
 		{ emit1(0xCB00 + ($1->i_value << 3) + ($4 & 0377), $2, 0, ET_NOARG_DISP); }
 |
@@ -2303,6 +2605,29 @@ operation:
 |
 	DAD evenreg8 { emitdad(040, $2); }
 |
+	ARITH16 bcdesp
+		{
+			emit(2, E_CODE, 0, $1->i_value >> 8, $1->i_value | $2);
+		}
+|
+	ARITH16 mar
+		{
+			int dst = $1->i_value >> 8;
+			int reg = $2 >> 8;
+			if (!reg) reg = 0xed;
+
+			if (dst != reg) {
+				if (dst == 0xed)
+					fprintf(stderr, "dadc/dsbc cannot take ix or iy\n");
+				else if (dst == 0xdd)
+					fprintf(stderr, "dadx cannot take hl or iy\n");
+				else
+					fprintf(stderr, "dady cannot take hl or ix\n");
+				err[gflag]++;
+			}
+			emit(2, E_CODE, 0, $1->i_value >> 8, $1->i_value | $2);
+		}
+|
 	INCDEC evenreg
 		{ emit1(($1->i_value << 3) + ($2 & 0377) + 3, $2, 0, ET_NOARG); }
 |
@@ -2315,6 +2640,21 @@ operation:
 	PUSHPOP pushable8
 		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG); }
 |
+	BIT expression
+		{
+			if (strcmp($1->i_string, "set") == 0 && label) {
+				// Clear error that label definition will have been set
+				err[mflag] = 0;
+				itemcpy(label, &pristine_label);
+				do_defl(label, $2, 0);
+				list_dollarsign = 0;
+				list_addr = label->i_value;
+			}
+			else {
+				err[fflag]++;
+			}
+		}
+|
 	BIT expression ',' reg
 		{
 			int bit = $2->e_value;
@@ -2323,6 +2663,17 @@ operation:
 			if (bit < 0 || bit > 7)
 				err[vflag]++;
 			emit1($1->i_value + ((bit & 7) << 3) + ($4 & 0377), $4, 0, ET_NOARG_DISP);
+		}
+|
+	BIT_XY expression ',' dxy
+		{
+			int bit = $2->e_value;
+			expr_number_check($2);
+			expr_free($2);
+			if (bit < 0 || bit > 7)
+				err[vflag]++;
+			emit(4, E_CODE, 0, $1->i_value >> 8, 0xcb, disp,
+				$1->i_value | (bit << 3));
 		}
 |
 	BIT expression ',' memxy ',' realreg
@@ -2361,6 +2712,9 @@ operation:
 |
 	JR spcondition ',' expression
 		{ emitjr($1->i_value + $2, $4); }
+|
+	JR_COND expression
+		{ emitjr($1->i_value, $2); }
 |
 	DJNZ expression
 		{ emitjr($1->i_value, $2); }
@@ -2402,6 +2756,16 @@ operation:
 			emit1(0100 + (($2 & 7) << 3) + ($4 & 7),$2 | $4, 0, ET_NOARG_DISP);
 		}
 |
+	LD_XY realreg ',' dxy
+		{
+			emit(3, E_CODE, 0, $1->i_value >> 8, $1->i_value | ($2 << 3), disp);
+		}
+|
+	ST_XY realreg ',' dxy
+		{
+			emit(3, E_CODE, 0, $1->i_value >> 8, $1->i_value | $2, disp);
+		}
+|
 	MOV reg8 ',' reg8
 		{
 			if ($2 == 6 && $4 == 6) err[gflag]++;
@@ -2410,6 +2774,11 @@ operation:
 |
 	LD allreg ',' noparenexpr
 		{ emit1(6 + (($2 & 0377) << 3), $2, $4, ET_BYTE); }
+|
+	MV_XY expression ',' dxy
+		{
+			emit(3, E_CODE8, $2, $1->i_value >> 8, $1->i_value, disp);
+		}
 |
 	MVI reg8 ',' expression
 		{ emit1(6 + (($2 & 0377) << 3), $2, $4, ET_BYTE); }
@@ -2531,6 +2900,12 @@ operation:
 				emit1(0371, $4, 0, ET_NOARG);
 		}
 |
+	LDST16 expression
+		{
+			expr_word_check($2);
+			emit(2, E_CODE16, $2, $1->i_value >> 8, $1->i_value);
+		}
+|
 	EX RP ',' HL
 		{
 			if ($2->i_value != 020) {
@@ -2570,6 +2945,9 @@ operation:
 	TK_IN realreg ',' '(' C ')'
 		{ emit(2, E_CODE, 0, 0355, 0100 + ($2 << 3)); }
 |
+	INP realreg
+		{ emit(2, E_CODE, 0, 0355, 0101 + ($2 << 3)); }
+|
 	TK_IN 'F' ',' '(' C ')'
 		{ emit(2, E_CODE, 0, 0355, 0160); }
 |
@@ -2592,6 +2970,9 @@ operation:
 |
 	TK_OUT '(' C ')' ',' realreg
 		{ emit(2, E_CODE, 0, 0355, 0101 + ($6 << 3)); }
+|
+	OUTP realreg
+		{ emit(2, E_CODE, 0, 0355, 0101 + ($2 << 3)); }
 |
 	TK_OUT '(' C ')' ',' expression
 		{
@@ -2670,6 +3051,8 @@ operation:
 |
 	ASSERT expression
 		{
+			list_dollarsign = 0;
+			list_addr = $2->e_value;
 			expr_number_check($2);
 			if (outpass && !$2->e_value)
 			{
@@ -2680,6 +3063,8 @@ operation:
 |
 	TSTATE expression
 		{
+			list_dollarsign = 0;
+			list_addr = $2->e_value;
 			expr_number_check($2);
 			tstates = $2->e_value;
 			tstatesum[emit_addr] = tstates;
@@ -2688,21 +3073,22 @@ operation:
 |
 	SETOCF expression
 		{
+			list_dollarsign = 0;
+			list_addr = $2->e_value;
 			expr_number_check($2);
 			ocf = $2->e_value;
 			ocfsum[emit_addr] = ocf;
 			expr_free($2);
 		}
 |
-	DEFB db.list
+	DEFB { full_exprs = 1; } db.list { full_exprs = 0; }
 |
-	DEFW dw.list
+	DEFW { full_exprs = 1; } dw.list { full_exprs = 0; }
 |
-	DEFD dd.list
+	DEFD { full_exprs = 1; } dd.list { full_exprs = 0; }
 |
 	ENDM
 ;
-
 
 parm.list:
 |
@@ -2711,12 +3097,13 @@ parm.list:
 	parm.list ',' parm.element
 ;
 
+parm.single: { param_parse = 1; } parm.element { param_parse = 0; };
+
 maybeocto: { $$ = 0; } | '#' { $$ = 1; };
 
 parm.element:
-	maybeocto UNDECLARED
+	maybeocto MPARM
 		{
-			$2->i_token = MPARM;
 			if (parm_number >= PARMMAX)
 				error("Too many parameters");
 			$2->i_value = parm_number++;
@@ -2725,9 +3112,23 @@ parm.element:
 		}
 ;
 
-locals:
+locals: local_decls {
+		static char macpush[LINEBUFFERSIZE];
+		// Because of locals the parser has to look ahead.
+		// We'll have buffered that as we usually do so just a
+		// matter of picking that up and cancelling any look-ahead.
+		*lineptr = '\0';
+		strcpy(macpush, linebuf);
+		lineptr = linebuf;
+		peekc = -1;
+		yychar = YYEMPTY;
+		$$ = macpush;
+	}
+;
+
+local_decls:
 |
-	LOCAL	local.list '\n' { list1(); }
+	local_decls LOCAL { param_parse = 1; } local.list '\n' { param_parse = 0; list1(); }
 ;
 
 local.list:
@@ -2738,9 +3139,8 @@ local.list:
 ;
 
 local.element:
-	UNDECLARED
+	MPARM
 		{
-			$1->i_token = MPARM;
 			if (parm_number >= PARMMAX)
 				error("Too many parameters");
 			$1->i_value = parm_number++;
@@ -2768,7 +3168,17 @@ arg.element:
 			est2[parm_number++].param = cp;
 			strcpy(cp, tempbuf);
 		}
+|
+	'%' { arg_flag = 0; } expression
+		{
+			arg_flag = 1;
+			expr_reloc_check($3);
+			sprintf(tempbuf, "%d", $3->e_value);
+			est2[parm_number++].param = strdup(tempbuf);
+			expr_free($3);
+		}
 ;
+
 allreg:
 	reg
 |
@@ -2818,20 +3228,29 @@ mem:
 	memxy
 ;
 memxy:
-	'(' INDEX expression ')'
+	'(' INDEX dxy ')'
 		{
-			expr_number_check($3);
-			disp = $3->e_value;
-			expr_free($3);
 			$$ = ($2->i_value & 0177400) | 6;
-			if (disp > 127 || disp < -128)
-				err[vflag]++;
 		}
 |
 	'(' INDEX ')'
 		{
 			disp = 0;
 			$$ = ($2->i_value & 0177400) | 6;
+		}
+|
+	dxy '(' INDEX ')'
+		{
+			$$ = ($3->i_value & 0177400) | 6;
+		}
+;
+dxy:	expression
+		{
+			expr_number_check($1);
+			disp = $1->e_value;
+			expr_free($1);
+			if (disp > 127 || disp < -128)
+				err[vflag]++;
 		}
 ;
 evenreg:
@@ -2992,12 +3411,18 @@ parenexpr:
 ;
 
 noparenexpr:
+/*
+  This rule commented out because it doesn't actually produce expression
+  errors but instead stops parsing.  That's because it doesn't clear the
+  parse error with yyerrok.  I tried to add that but couldn't come up with
+  a recovery that works in all cases.  In fact, it often infinite loops.
 	error
 		{
 			err[eflag]++;
 			$$ = expr_num(0);
 		}
 |
+*/
 	LABEL
 		{
 			$$ = expr_alloc();
@@ -3047,7 +3472,7 @@ noparenexpr:
 |
 	'$'
 		{
-			$$ = expr_num(dollarsign);
+			$$ = expr_num(dollarsign + emitptr - emitbuf);
 			$$->e_scope = segment;
 		}
 |
@@ -3060,7 +3485,9 @@ noparenexpr:
 			$$->e_value = 0;
 
 			if (!($1->i_scope & SCOPE_EXTERNAL)) {
-				err[uflag]++;
+				sprintf(detail, "'%s' %s", $1->i_string, errname[uflag]);
+				// Would be nice to add to list of undeclared errors
+				errwarn(uflag, detail);
 			}
 		}
 |
@@ -3070,7 +3497,15 @@ noparenexpr:
 			$$->e_token = 'm';
 			$$->e_item = $1;
 			$$->e_scope = $1->i_scope;
-			$$->e_value = 0;
+			// Use the current value.  Harmless enough as this
+			// will normally error out yet vital to allow
+			// "var set var+1" to function.
+			$$->e_value = $1->i_value;
+		}
+|
+	NUL { raw = 2; } RAWTOKEN
+		{
+			$$ = expr_num(tempbuf[0] ? -1 : 0);
 		}
 |
 	expression '+' expression
@@ -3080,11 +3515,11 @@ noparenexpr:
 			// Can't operate on external labels.
 			// But we can add constants to any scope.
 			if (!(($1->e_scope | $3->e_scope) & SCOPE_EXTERNAL) &&
-				(($1->e_scope && SCOPE_SEGMASK) == 0 ||
-				($3->e_scope && SCOPE_SEGMASK) == 0))
+				(($1->e_scope & SCOPE_SEGMASK) == 0 ||
+				($3->e_scope & SCOPE_SEGMASK) == 0))
 			{
 				$$->e_scope &= ~(SCOPE_NORELOC | SCOPE_SEGMASK);
-				$$->e_scope |= ($1->e_scope | $3->e_scope & SCOPE_SEGMASK);
+				$$->e_scope |= ($1->e_scope | $3->e_scope) & SCOPE_SEGMASK;
 			}
 		}
 |
@@ -3281,25 +3716,23 @@ symbol:
 al:
 	{ int i;
 		if (expptr >= MAXEXP)
-			error("Macro expansion level");
-		est2 = (union exprec *) malloc((PARMMAX + 4) * sizeof *est2);
+			error("Macro expansion level too deep");
+		est2 = (union exprec *) malloc((PARMMAX + PAREXT) * sizeof *est2);
 		expstack[expptr] = est2;
 		for (i=0; i<PARMMAX; i++)
 			est2[i].param = 0;
-		arg_flag++;
+		arg_start();
 	}
 ;
 
 
 arg_on:
-	{	arg_flag++;	}
+	{	arg_start();	}
 ;
 
 arg_off:
-		{	arg_flag = 0;	}
+		{	arg_reset();	}
 ;
-
-raw_on: { raw = 1; }
 
 %%
 /*extern int	yylval;*/
@@ -3377,6 +3810,8 @@ char	numpart[] = {
 #define Z80	(4)	/* used in Z80 instructions */
 #define UNDOC	(8)	/* used only in undocumented instructions */
 #define TERM	(16)	/* can appear in expressions (not all marked) */
+#define ZNONSTD	(32)	/* non-standard Z-80 mnemonic (probably TDL or DRI) */
+#define COL0	(64)	/* will always be recognized in logical column 0 */
 
 struct	item	keytab[] = {
 	{"*mod",	0,	MRAS_MOD,	VERB },
@@ -3384,11 +3819,17 @@ struct	item	keytab[] = {
 	{"a",		7,	ACC,		I8080 | Z80 },
 	{"aci",		0316,	ALUI8,		VERB | I8080 },
 	{"adc",		1,	ARITHC,		VERB | I8080 | Z80  },
+	{"adcx",	0xdd8e,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"adcy",	0xfd8e,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"add",		0,	ADD,		VERB | I8080 | Z80  },
+	{"addx",	0xdd86,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"addy",	0xfd86,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"adi",		0306,	ALUI8,		VERB | I8080 },
 	{"af",		060,	AF,		Z80 },
 	{"ana",		4,	ARITHC,		VERB | I8080},
 	{"and",		4,	AND,		VERB | Z80 | TERM },
+	{"andx",	0xdda6,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"andy",	0xfda6,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"ani",		0346,	ALUI8,		VERB | I8080 },
 	{".ascii",	0,	DEFB,		VERB },
 	{".aseg",	SEG_ABS,SETSEG,		VERB },
@@ -3397,16 +3838,24 @@ struct	item	keytab[] = {
 	{"b",		0,	REGNAME,	I8080 | Z80 },
 	{"bc",		0,	RP,		Z80 },
 	{"bit",		0145500,BIT,		VERB | Z80 },
+	{"bitx",	0xdd46,	BIT_XY,		VERB | Z80 | ZNONSTD },
+	{"bity",	0xfd46,	BIT_XY,		VERB | Z80 | ZNONSTD },
 	{".block",	0,	DEFS,		VERB },
 	{".byte",	0,	DEFB,		VERB },
 	{"c",		1,	C,		I8080 | Z80 },
 	{"call",	0315,	CALL,		VERB | I8080 | Z80 },
 	{"cc",		0334,	CALL8,		VERB | I8080 },
+	{"ccd",		0xeda9,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"ccdr",	0xedb9,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"ccf",		077,	NOOPERAND,	VERB | Z80 },
+	{"cci",		0xeda1,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"ccir",	0xedb1,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"cm",		0374,	CALL8,		VERB | I8080 },
 	{"cma",		057,	NOOPERAND,	VERB | I8080 },
 	{"cmc",		077,	NOOPERAND,	VERB | I8080 },
 	{"cmp",		7,	LOGICAL,	VERB | I8080 },
+	{"cmpx",	0xddbe,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"cmpy",	0xfdbe,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"cnc",		0324,	CALL8,		VERB | I8080 },
 	{"cnz",		0304,	CALL8,		VERB | I8080 },
 	{".comment",	SPCOM,	SPECIAL,	VERB },
@@ -3424,10 +3873,17 @@ struct	item	keytab[] = {
 	{"d",		2,	REGNAME,	I8080 | Z80 },
 	{"daa",		0047,	NOOPERAND,	VERB | I8080 | Z80 },
 	{"dad",		0,	DAD,		VERB | I8080 },
+	{"dadc",	0xed4a,	ARITH16,	VERB | Z80 | ZNONSTD },
+	{"dadx",	0xdd09,	ARITH16,	VERB | Z80 | ZNONSTD },
+	{"dady",	0xfd09,	ARITH16,	VERB | Z80 | ZNONSTD },
 	{".db",		0,	DEFB,		VERB },
 	{".dc",		0,	DC,		VERB },
 	{"dcr",		1,	INRDCR,		VERB | I8080 },
+	{"dcrx",	0xdd35,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"dcry",	0xfd35,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"dcx",		1,	INXDCX,		VERB | I8080 },
+	{"dcxix",	0xdd2b,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"dcxiy",	0xfd2b,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"de",		020,	RP,		Z80 },
 	{"dec",		1,	INCDEC,		VERB | I8080 | Z80 },
 	{".defb",	0,	DEFB,		VERB },
@@ -3440,6 +3896,7 @@ struct	item	keytab[] = {
 	{"di",		0363,	NOOPERAND,	VERB | I8080 | Z80 },
 	{"djnz",	020,	DJNZ,		VERB | Z80 },
 	{".ds",		0,	DEFS,		VERB },
+	{"dsbc",	0xed42,	ARITH16,	VERB | Z80 | ZNONSTD },
 	{".dseg",	SEG_DATA,SETSEG,	VERB },
 	{".dw",		0,	DEFW,		VERB },
 	{".dword",	0,	DEFD,		VERB },
@@ -3456,6 +3913,8 @@ struct	item	keytab[] = {
 	{"eq",		0,	'=',		0 },
 	{".equ",	0,	EQU,		VERB },
 	{"ex",		0,	EX,		VERB | Z80 },
+	{"exaf",	0x08,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{".exitm", 	0,	EXITM,		VERB },
 	{".ext",	0,	EXTRN,		VERB },
 	{".extern",	0,	EXTRN,		VERB },
 	{".extrn",	0,	EXTRN,		VERB },
@@ -3471,8 +3930,11 @@ struct	item	keytab[] = {
 	{"hl",		040,	HL,		Z80 },
 	{"hlt",		0166,	NOOPERAND,	VERB | I8080 },
 	{"i",		0,	MISCREG,	Z80 },
-	{".if",		0,	IF_TK,		VERB },
+	{".if",		0,	IF_TK,		VERB | COL0 },
 	{"im",		0166506,IM,		VERB | Z80 },
+	{"im0",		0xed46,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"im1",		0xed56,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"im2",		0xed5e,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"in",		0333,	TK_IN,		VERB | I8080 | Z80 },
 	{"inc",		0,	INCDEC,		VERB | Z80 },
 	{".incbin", 	0, 	INCBIN,		VERB },
@@ -3481,8 +3943,15 @@ struct	item	keytab[] = {
 	{"indr",	0166672,NOOPERAND,	VERB | Z80 },
 	{"ini",		0166642,NOOPERAND,	VERB | Z80 },
 	{"inir",	0166662,NOOPERAND,	VERB | Z80 },
+	{"inp",		0,	INP,		VERB | Z80 | ZNONSTD },
 	{"inr",		0,	INRDCR,		VERB | I8080 },
+	{"inrx",	0xdd34,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"inry",	0xfd34,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"inx",		0,	INXDCX,		VERB | I8080 },
+	{"inxix",	0xdd23,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"inxiy",	0xfd23,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"irp",		0,	IRP,		VERB },
+	{"irpc",	0,	IRPC,		VERB },
 	{"ix",		0156440,INDEX,		Z80 },
 	{"ixh",		0x1DD04,IXYLH,		Z80 | UNDOC },
 	{"ixl",		0x1DD05,IXYLH,		Z80 | UNDOC },
@@ -3499,24 +3968,40 @@ struct	item	keytab[] = {
 	{".jperror",	0,	JPERROR,	VERB },
 	{"jpo",		0342,	JUMP8,		VERB | I8080 },
 	{"jr",		040,	JR,		VERB | Z80 },
+	{"jrc",		0x38,	JR_COND,	VERB | Z80 | ZNONSTD },
+	{"jrnc",	0x30,	JR_COND,	VERB | Z80 | ZNONSTD },
+	{"jrnz",	0x20,	JR_COND,	VERB | Z80 | ZNONSTD },
 	{".jrpromote",	0,	JRPROMOTE,	VERB },
+	{"jrz",		0x28,	JR_COND,	VERB | Z80 | ZNONSTD },
 	{"jz",		0312,	JUMP8,		VERB | I8080 },
 	{"l",		5,	REGNAME,	I8080 | Z80 },
+	{"lbcd",	0xed4b,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"ld",		0,	LD,		VERB | Z80 },
 	{"lda",		0,	LDA,		VERB | I8080 },
+	{"ldai",	0xed57,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"ldar",	0xed5f,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"ldax",	0,	LDAX,		VERB | I8080 },
 	{"ldd",		0166650,NOOPERAND,	VERB | Z80 },
 	{"lddr",	0166670,NOOPERAND,	VERB | Z80 },
+	{"lded",	0xed5b,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"ldi",		0166640,NOOPERAND,	VERB | Z80 },
 	{"ldir",	0166660,NOOPERAND,	VERB | Z80 },
+	{"ldx",		0xdd46,	LD_XY,		VERB | Z80 | ZNONSTD},
+	{"ldy",		0xfd46,	LD_XY,		VERB | Z80 | ZNONSTD},
 	{"le",		0,	LE,		0 },
 	{"lhld",	0,	LHLD,		VERB | I8080 },
 	{".list",	0,	LIST,		VERB },
+	{"lixd",	0xdd2a,	LDST16,		VERB | Z80 | ZNONSTD },
+	{"liyd",	0xfd2a,	LDST16,		VERB | Z80 | ZNONSTD },
 	{".local",	0,	LOCAL,		VERB },
 	{"low",		0,	LOW,		0 },
+	{"lspd",	0xed7b,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"lt",		0,	LT,		0 },
 	{"lxi",		0,	LXI,		VERB | I8080 },
+	{"lxix",	0xdd21,	LDST16,		VERB | Z80 | ZNONSTD },
+	{"lxiy",	0xfd21,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"m",		070,	COND,		I8080 | Z80 },
+	{".maclib",	PSMACLIB,ARGPSEUDO,	VERB },
 	{".macro",	0,	MACRO,		VERB },
 	{".max",	1,	MINMAX,		VERB },
 	{".min",	0,	MINMAX,		VERB },
@@ -3524,6 +4009,8 @@ struct	item	keytab[] = {
 	{"mod",		0,	MOD,		0 },
 	{"mov",		0,	MOV,		VERB | I8080 },
 	{"mvi",		0,	MVI,		VERB | I8080 },
+	{"mvix",	0xdd36,	MV_XY,		VERB | Z80 | ZNONSTD },
+	{"mviy",	0xfd36,	MV_XY,		VERB | Z80 | ZNONSTD },
 	{".name",	SPNAME,	SPECIAL,	VERB },
 	{"nc",		020,	SPCOND,		0 },
 	{"ne",		0,	NE,		0 },
@@ -3531,6 +4018,7 @@ struct	item	keytab[] = {
 	{".nolist",	-1,	LIST,		VERB },
 	{"nop",		0,	NOOPERAND,	VERB | I8080 | Z80 },
 	{"not",		0,	NOT,		0 },
+	{"nul",		0,	NUL,		0 },
 	{"nv",		040,	COND,		Z80 },
 	{"nz",		0,	SPCOND,		Z80 },
 	{"ocf",		0,	OCF,		0 },
@@ -3538,29 +4026,50 @@ struct	item	keytab[] = {
 	{"ora",		6,	LOGICAL,	VERB | I8080 },
 	{".org",	0,	ORG,		VERB },
 	{"ori",		0366,	ALUI8,		VERB | I8080 },
+	{"orx",		0xddb6,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"ory",		0xfdb6,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"otdr",	0166673,NOOPERAND,	VERB | Z80 },
 	{"otir",	0166663,NOOPERAND,	VERB | Z80 },
 	{"out",		0323,	TK_OUT,		VERB | I8080 | Z80 },
 	{"outd",	0166653,NOOPERAND,	VERB | Z80 },
+	{"outdr",	0166673,NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"outi",	0166643,NOOPERAND,	VERB | Z80 },
+	{"outir",	0166663,NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"outp",	0,	OUTP,		VERB | Z80 | ZNONSTD },
 	{"p",		060,	COND,		Z80 },
 	{".page",	1,	LIST,		VERB },
 	{"pchl",	0351,	NOOPERAND,	VERB | I8080 },
+	{"pcix",	0xdde9,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"pciy",	0xfde9,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"pe",		050,	COND,		Z80 },
 	{"pfix",	0xdd,	NOOPERAND,	VERB | Z80 | UNDOC },
 	{"pfiy",	0xfd,	NOOPERAND,	VERB | Z80 | UNDOC },
 	{".phase",	0,	PHASE,		VERB },
 	{"po",		040,	COND,		Z80 },
 	{"pop",		0301,	PUSHPOP,	VERB | I8080 | Z80 },
+	{"popix",	0xdde1,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"popiy",	0xfde1,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"pragma",	SPPRAGMA,SPECIAL,	VERB },
 	{"psw", 	060,	PSW,		I8080 },
 	{".public",	0,	PUBLIC,		VERB },
 	{"push",	0305,	PUSHPOP,	VERB | I8080 | Z80 },
+	{"pushix",	0xdde5,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"pushiy",	0xfde5,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"r",		010,	MISCREG,	Z80 },
 	{"ral",		027,	NOOPERAND,	VERB | I8080 },
+	{"ralr",	2,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"ralx",	0xdd16,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"raly",	0xfd16,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"rar",		037,	NOOPERAND,	VERB | I8080 },
+	{"rarr",	3,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"rarx",	0xdd1e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"rary",	0xfd1e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"rc",		0330,	NOOPERAND,	VERB | I8080 },
 	{".read",	PSINC,	ARGPSEUDO,	VERB },
+	{"rept",	0,	REPT,		VERB },
 	{"res",		0145600,BIT,		VERB | Z80 },
+	{"resx",	0xdd86,	BIT_XY,		VERB | Z80 | ZNONSTD },
+	{"resy",	0xfd86,	BIT_XY,		VERB | Z80 | ZNONSTD },
 	{"ret",		0311,	RET,		VERB | I8080 | Z80 },
 	{"reti",	0166515,NOOPERAND,	VERB | Z80 },
 	{"retn",	0166505,NOOPERAND,	VERB | Z80 },
@@ -3568,6 +4077,9 @@ struct	item	keytab[] = {
 	{"rla",		027,	NOOPERAND,	VERB | Z80 },
 	{"rlc",		0,	SHIFT,		VERB | I8080 | Z80 },
 	{"rlca",	07,	NOOPERAND,	VERB | Z80 },
+	{"rlcr",	0,	SHIFT,		VERB | I8080 | Z80 | ZNONSTD },
+	{"rlcx",	0xdd06,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"rlcy",	0xfd06,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"rld",		0166557,NOOPERAND,	VERB | Z80 },
 	{"rm",		0370,	NOOPERAND,	VERB | I8080 },
 	{".rmem",	0,	DEFS,		VERB },
@@ -3580,33 +4092,63 @@ struct	item	keytab[] = {
 	{"rra",		037,	NOOPERAND,	VERB | Z80 },
 	{"rrc",		1,	SHIFT,		VERB | I8080 | Z80 },
 	{"rrca",	017,	NOOPERAND,	VERB | Z80 },
+	{"rrcr",	1,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"rrcx",	0xdd0e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"rrcy",	0xfd0e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"rrd",		0166547,NOOPERAND,	VERB | Z80 },
 	{"rst",		0307,	RST,		VERB | I8080 | Z80 },
 	{".rsym",	PSRSYM,	ARGPSEUDO,	VERB },
 	{"rz",		0310,	NOOPERAND,	VERB | I8080 },
 	{"sbb",		3,	ARITHC,		VERB | I8080 },
 	{"sbc",		3,	ARITHC,		VERB | Z80 },
+	{"sbcd",	0xed43,	LDST16,		VERB | Z80 | ZNONSTD },
+	{"sbcx",	0xdd9e,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"sbcy",	0xfd9e,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"sbi",		0336,	ALUI8,		VERB | I8080 },
 	{"scf",		067,	NOOPERAND,	VERB | Z80 },
+	{"sded",	0xed53,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"set",		0145700,BIT,		VERB | Z80 },
+	{"setb",	0145700,BIT,		VERB | Z80 | ZNONSTD },
 	{".setocf",	0,	SETOCF,		VERB },
 	{".sett",	0,	TSTATE,		VERB },
+	{"setx",	0xddc6,	BIT_XY,		VERB | Z80 | ZNONSTD },
+	{"sety",	0xfdc6,	BIT_XY,		VERB | Z80 | ZNONSTD },
 	{"shl",		0,	SHL,		TERM },
 	{"shld",	0,	SHLD,		VERB | I8080 },
 	{"shr",		0,	SHR,		TERM },
+	{"sixd",	0xdd22,	LDST16,		VERB | Z80 | ZNONSTD },
+	{"siyd",	0xfd22,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"sl1",		6,	SHIFT,		VERB | Z80 | UNDOC },
 	{"sla",		4,	SHIFT,		VERB | Z80 },
+	{"slar",	4,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"slax",	0xdd26,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"slay",	0xfd26,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"sll",		6,	SHIFT,		VERB | Z80 },
 	{"sp",		060,	SP,		I8080 | Z80 },
 	{".space",	2,	LIST,		VERB },
 	{"sphl",	0371,	NOOPERAND,	VERB | I8080 },
+	{"spix",	0xddf9,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"spiy",	0xfdf9,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"sra",		5,	SHIFT,		VERB | Z80 },
+	{"srar",	5,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"srax",	0xdd2e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"sray",	0xfd2e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"srl",		7,	SHIFT,		VERB | Z80 },
+	{"srlr",	7,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"srlx",	0xdd3e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"srly",	0xfd3e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"sspd",	0xed73,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"sta",		0,	STA,		VERB | I8080 },
+	{"stai",	0xed47,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"star",	0xed4f,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"stax",	0,	STAX,		VERB | I8080 },
 	{"stc",		067,	NOOPERAND,	VERB | I8080 },
+	{"stx",		0xdd70,	ST_XY,		VERB | Z80 | ZNONSTD},
+	{"sty",		0xfd70,	ST_XY,		VERB | Z80 | ZNONSTD},
 	{"sub",		2,	LOGICAL,	VERB | I8080 | Z80 },
 	{".subttl",	SPSBTL,	SPECIAL,	VERB },
+	{"subx",	0xdd96,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"suby",	0xfd96,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"sui",		0326,	ALUI8,		VERB | I8080 },
 	{"t",		0,	T,		0 },
 	{".text",	0,	DEFB,		VERB },
@@ -3619,9 +4161,13 @@ struct	item	keytab[] = {
 	{".wsym",	PSWSYM,	ARGPSEUDO,	VERB },
 	{"xchg",	0353,	NOOPERAND,	VERB | I8080 },
 	{"xor",		5,	XOR,		VERB | Z80 | TERM },
+	{"xorx",	0xddae,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"xory",	0xfdae,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"xra",		5,	LOGICAL,	VERB | I8080 },
 	{"xri",		0356,	ALUI8,		VERB | I8080 },
 	{"xthl",	0343,	NOOPERAND,	VERB | I8080 },
+	{"xtix",	0xdde3,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"xtiy",	0xfde3,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"z",		010,	SPCOND,		Z80 },
 	{".z80",	1,	INSTSET,	VERB },
 };
@@ -3632,8 +4178,6 @@ struct	item	keytab[] = {
 
 struct item	itemtab[ITEMTABLESIZE];
 struct item	*itemmax = itemtab+ITEMTABLESIZE;
-
-
 
 
 
@@ -3649,10 +4193,28 @@ int yylex()
 	char *d0, *dn;
 	int exclude, include, overflow;
 
-	if (arg_flag)
-		return(getarg());
+	if (arg_flag) {
+		yylval.cval = arg_state.arg;
+		c = getarg(&arg_state);
+		if (c == '\0' || c == '\n' || c == ';')
+			c = skipline(c);
 
-	if (raw) {
+		return c;
+	}
+
+	if (raw == 2) {
+		while (charclass[c = nextchar()] == SPACE)
+			;
+
+		*tempbuf = c == '\n' || c == '\0';
+
+		peekc = skipline(c);
+
+		raw = 0;
+
+		return RAWTOKEN;
+	}
+	else if (raw) {
 		int skip = 1;
 		p = tempbuf;
 		while ((c = nextchar()) != '\n' && c) {
@@ -3679,12 +4241,64 @@ int yylex()
 		return RAWTOKEN;
 	}
 
-for (;;) switch(charclass[c = nextchar()]) {
+	for (;;) switch(charclass[c = nextchar()]) {
 	case F_END:
-		if (expptr) {
+		if (!expptr)
+			return 0;
+
+		if (est[MSTR].param) {
+			int ch;
+			est[REPNUM].value++;
+			ch = est[MSTR].param[est[REPNUM].value];
+			if (ch) {
+				est[0].param[0] = ch;
+				floc = est[MSTART].value;
+				mfseek(mfile, (long)floc, 0);
+				est[TEMPNUM].value = exp_number++;
+			}
+			else {
+				free(est[MSTR].param);
+				est[MSTR].param = 0;
+				popsi();
+			}
+		}
+		else if (est[REPNUM].value < 0) {
+			int arg;
+			do {
+				switch (getarg(est[MARGP].ap)) {
+				case ARG:
+					arg = 1;
+					break;
+				case ',':
+					arg = 0;
+					break;
+				default:
+					arg = 2;
+					break;
+				}
+			} while (!arg);
+
+			if (arg == 1) {
+				floc = est[MSTART].value;
+				mfseek(mfile, (long)floc, 0);
+				est[TEMPNUM].value = exp_number++;
+			}
+			else {
+				// XXX - memory leak
+				est[0].param = NULL;
+				free(est[MARGP].ap);
+				popsi();
+			}
+		}
+		else if (est[REPNUM].value-- > 0) {
+			floc = est[MSTART].value;
+			mfseek(mfile, (long)floc, 0);
+			est[TEMPNUM].value = exp_number++;
+		}
+		else
 			popsi();
-			continue;
-		} else return(0);
+
+		continue;
 
 	case SPACE:
 		while (charclass[c = nextchar()] == SPACE)
@@ -3732,6 +4346,26 @@ for (;;) switch(charclass[c = nextchar()]) {
 			charclass[c]==STARTER || charclass[c]==DOLLAR);
 
 		*p = '\0';
+
+		// When parsing macro parameters we use a custom symbol table.
+		// And, heck, almost anything goes.
+		if (param_parse) {
+			struct item *param = item_lookup(tempbuf, paramtab, PARAMTABSIZE);
+			peekc = c;
+			if (param->i_token) {
+				sprintf(detail, "%s error.  Macro parameter '%s' repeated",
+					errname[fflag], tempbuf);
+				errwarn(fflag, detail);
+			}
+
+			param->i_token = MPARM;
+			param->i_string = malloc(strlen(tempbuf) + 1);
+			strcpy(param->i_string, tempbuf);
+
+			yylval.itemptr = param;
+			return param->i_token;
+		}
+
 		// Special case for AF'
 		if (c == '\'' && strcmp(tempbuf, "af") == 0)
 			return AFp;
@@ -3760,7 +4394,7 @@ for (;;) switch(charclass[c = nextchar()]) {
 		//	we give tokenization a chance otherwise label
 		// If logcol >= 2 we're in the arguments
 		//
-		// There is quite a lot of unrealziaed scope for error
+		// There is quite a lot of unrealized scope for error
 		// detection and helpful warnings.
 
 		 // Default to any tokenization.
@@ -3768,13 +4402,16 @@ for (;;) switch(charclass[c = nextchar()]) {
 		include = 0;
 
 		if (logcol >= 2) {
+			// Arguments allow mnemonics and psuedo-ops
 			exclude = VERB;
 			include = TERM;
 		}
-		else if (logcol == 0 && c != ';' && c != '\n')
-			exclude = VERB;
+		else if (logcol == 0 && c != ';' && c != '\n') {
+			exclude = ~TERM;
+			include = COL0;
+		}
 		else if (logcol == 1 && c == ':') {
-			exclude = VERB;
+			exclude = ~TERM;
 			logcol = 0;
 		}
 
@@ -3847,8 +4484,10 @@ for (;;) switch(charclass[c = nextchar()]) {
 
 		if (tempbuf[0] == '$') {
 			if (logcol == 1 || locate(tempbuf)->i_token) {
-				if (radix > 0)
-					err[warn_hex]++;
+				if (radix > 0) {
+					sprintf(detail, "warning: $hex constant '%s' interpreted as symbol", tempbuf);
+					errwarn(warn_hex, detail);
+				}
 				radix = 0;
 			}
 		}
@@ -3922,18 +4561,25 @@ for (;;) switch(charclass[c = nextchar()]) {
 				retstring:
 					peekc = c;
 					*p = '\0';
-					if ((p-tempbuf) >2) {
-						yylval.cval = tempbuf;
-						return(STRING);
-					} else if (p-tempbuf == 2)	{
+					switch (p - tempbuf) {
+					case 2:
 						p = tempbuf;
-						yylval.ival = *p++ ;
-						yylval.ival |= *p<<8;
-						return(TWOCHAR);
-					} else	{
+						yylval.ival = *p++ & 255;
+						yylval.ival |= (*p & 255) << 8;
+						return TWOCHAR;
+					case 1:
 						p = tempbuf;
 						yylval.ival = *p++;
-						return(ONECHAR);
+						return ONECHAR;
+					case 0:
+						if (!full_exprs) {
+							yylval.ival = 0;
+							return NUMBER;
+						}
+						// fall through
+					default:
+						yylval.cval = tempbuf;
+						return STRING;
 					}
 				}
 				*p++ = c;
@@ -4070,7 +4716,11 @@ struct item *keyword(char *name)
 	return 0;
 }
 
-struct item *locate(char *name)
+// Find 'name' in an item table.  Returns an empty slot if not found.
+// Uses case-independent comparisions which are largely wasted as
+// there is only 1 case where 'name' has not already been lowercased.
+
+struct item *item_lookup(char *name, struct item *table, int table_size)
 {
 	struct item *ip;
 	/*
@@ -4078,20 +4728,29 @@ struct item *locate(char *name)
 	 */
 	int hash = 0;
 	char *p = name;
-	while (*p) hash += *p++;
-	hash %= ITEMTABLESIZE;
-	ip = &itemtab[hash];
+	while (*p) {
+		char ch = *p++;
+		if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+		hash += ch;
+	}
+	hash %= table_size;
+	ip = &table[hash];
 
 	for (;;) {
 		if (ip->i_token == 0)
 			break;
-		if (strcmp(name, ip->i_string) == 0)
+		if (ci_strcmp(name, ip->i_string) == 0)
 			break;
-		if (++ip >= itemmax)
-			ip = itemtab;
+		if (++ip >= table + table_size)
+			ip = table;
 	}
 
 	return ip;
+}
+
+struct item *locate(char *name)
+{
+	return item_lookup(name, itemtab, ITEMTABLESIZE);
 }
 
 /*
@@ -4107,7 +4766,6 @@ struct item *locate(char *name)
 
 int tokenofitem(int deftoken, int keyexclude, int keyinclude)
 {
-	char *p;
 	struct item *ip;
 	int  i;
 
@@ -4115,6 +4773,16 @@ int tokenofitem(int deftoken, int keyexclude, int keyinclude)
 	fputs("'tokenofitem entry'	", stderr) ;
 	fputs(tempbuf, stderr) ;
 #endif
+
+	// Allow macros to override built-ins
+	// Maybe shouldn't be done for identifiers that will undergo
+	// '.' and '_' expansion.
+	ip = locate(tempbuf);
+	if (ip->i_token == MNAME)
+		goto found;
+
+	if (full_exprs)
+		keyexclude = ~TERM;
 
 	ip = keyword(tempbuf);
 	if (ip) {
@@ -4197,43 +4865,34 @@ token_done:
 	return(i) ;
 }
 
+void itemcpy(struct item *dst, struct item *src)
+{
+	if (dst && src) {
+		dst->i_string = src->i_string;
+		dst->i_value = src->i_value;
+		dst->i_token = src->i_token;
+		dst->i_uses = src->i_uses;
+		dst->i_scope = src->i_scope;
+		dst->i_chain = src->i_chain;
+	}
+}
 
 /*
  *  interchange two entries in the item table -- used by custom_qsort
  */
 void interchange(int i, int j)
 {
-	struct item *fp, *tp;
 	struct item temp;
 
-	fp = &itemtab[i];
-	tp = &itemtab[j];
-	temp.i_string = fp->i_string;
-	temp.i_value = fp->i_value;
-	temp.i_token = fp->i_token;
-	temp.i_uses = fp->i_uses;
-	temp.i_scope = fp->i_scope;
-	temp.i_chain = fp->i_chain;
-
-	fp->i_string = tp->i_string;
-	fp->i_value = tp->i_value;
-	fp->i_token = tp->i_token;
-	fp->i_uses = tp->i_uses;
-	fp->i_scope = tp->i_scope;
-	fp->i_chain = tp->i_chain;
-
-	tp->i_string = temp.i_string;
-	tp->i_value = temp.i_value;
-	tp->i_token = temp.i_token;
-	tp->i_uses = temp.i_uses;
-	tp->i_scope = temp.i_scope;
-	tp->i_chain = temp.i_chain;
+	itemcpy(&temp, itemtab + i);
+	itemcpy(itemtab + i, itemtab + j);
+	itemcpy(itemtab + j, &temp);
 }
 
 
 
 /*
- *  quick sort -- used by putsymtab to sort the symbol table
+ *  quick sort -- used by compactsymtab to sort the symbol table
  */
 void custom_qsort(int m, int n)
 {
@@ -4282,9 +4941,10 @@ int nextchar()
 			return 0;
 		}
 
-		if (!expptr && getcol() == 0) {
+		if (getcol() == 0) {
 			void analyze_inpbuf(void);
-			linein[now_in]++;
+			if (!expptr)
+				linein[now_in]++;
 			analyze_inpbuf();
 		}
 
@@ -4312,18 +4972,18 @@ int nextchar()
 			if (ch == '\1') { /* expand argument */
 				ch = getm() - 'A';
 				if (ch >= 0 && ch < PARMMAX && est[ch].param) {
-					strcpy(p, est[ch].param);
-					p = strchr(p, '\0');
+					strcpy((char *)p, est[ch].param);
+					p = (unsigned char *)strchr((char *)p, '\0');
 				}
 			}
 			else if (ch == '\2') {	/*  local symbol  */
 				ch = getm() - 'A';
 				if (ch >= 0 && ch < PARMMAX && est[ch].param)
-					strcpy(p, est[ch].param);
+					strcpy((char *)p, est[ch].param);
 				else
-					strcpy(p, getlocal(ch, est[TEMPNUM].value));
+					strcpy((char *)p, getlocal(ch, est[TEMPNUM].value));
 
-				p = strchr(p, '\0');
+				p = (unsigned char *)strchr((char *)p, '\0');
 			}
 			else {
 				if (ch == 0)
@@ -4423,22 +5083,30 @@ char *skipspace(char *p)
 void analyze_inpbuf(void)
 {
 	int cc;
-	char *p, *q;
-	struct item *ip;
+	char *p, *q, save;
+	char *word1, *word2;
+	struct item *ip, *word1item;
+	int triplecase = 1;
+
+	// No need to do this when pulling in data for a macro.  In fact,
+	// in can be harmful to undef a macro.
+	if (inmlex)
+		return;
 
 	// Default if we find nothing to override
 	logcol = 0;
 
-	// We'll only worry about one case for now.  When you start with
-	// whitespace yet there are 3 columns.  If so then we change logcol
-	// to -1 to compensate.  If the 2nd column is a VERB.
+	// One case to check is when you start with whitespace yet there are
+	// 3 columns.  If so then we change logcol to -1 to compensate.
+	// If the 2nd column is a VERB.
 
-	// Start by recognizing space and skipping or aborting if not found
-	p = inpbuf;
+	// If we start with whitespace then we can give up on triple word case.
+	p = (char *)inpbuf;
 	if (charclass[*p] != SPACE)
-		return;
+		triplecase = 0;
 
 	p = skipspace(p);
+	word1 = p;
 
 	// Now skip over a token or abort if we don't find one
 
@@ -4455,9 +5123,14 @@ void analyze_inpbuf(void)
 	}
 
 	// We could skip space-separated colons now, but if we see a colon
-	// the issue has been decided to do that because it is easier.
+	// both issues have been decided to do that because it is easier.
 	if (*p == ':')
 		return;
+
+	save = *p;
+	*p = '\0';
+	word1item = locate(word1);
+	*p = save;
 
 	p = skipspace(p);
 
@@ -4469,6 +5142,7 @@ void analyze_inpbuf(void)
 		return;
 
 	q = p;
+	word2 = p;
 	for (;;) {
 		cc = charclass[*p];
 		if (cc == LETTER || cc == STARTER || cc == DIGIT || cc == DOLLAR)
@@ -4476,6 +5150,18 @@ void analyze_inpbuf(void)
 		else
 			break;
 	}
+
+	// Now we have a second word we can check for the "name macro" case.
+	// Unless we're skipping.
+	save = *p;
+	*p = '\0';
+	if (ci_strcmp(word2, "macro") == 0 && word1item->i_token && !*ifptr)
+		word1item->i_token = UNDECLARED;
+
+	*p = save;
+
+	if (!triplecase)
+		return;
 
 	// Must have space to skip over
 	if (charclass[*p] != SPACE)
@@ -4840,6 +5526,8 @@ int main(int argc, char *argv[])
 
 		fprintf(fbds, "binary-debuggable-source\n");
 
+		fprintf(fbds, "%04x %04x f %s\n", dollarsign, emit_addr, src_name[now_in]);
+
 		outpath(oth, sourcef, ".cmd");
 		fcmd = fopen(oth, "wb");
 		if (fcmd == NULL)
@@ -4944,7 +5632,8 @@ int main(int argc, char *argv[])
 			putrelname(progname);
 		}
 
-		ip = &itemtab[-1];
+		ip = itemtab;
+		ip--;
 		while (++ip < itemmax) {
 			// Output list of public labels.  m80 will let
 			// equates and aseg values be public so we do, too.
@@ -4959,7 +5648,7 @@ int main(int argc, char *argv[])
 			/* set macro names, equated and defined names */
 			switch	(ip->i_token) {
 			case MNAME:
-				ip->i_token = OLDMNAME;
+				ip->i_token = UNDECLARED;
 				break;
 
 			case EQUATED:
@@ -5037,7 +5726,7 @@ int main(int argc, char *argv[])
 		struct item *ip;
 		// Output external symbols and value of public symbols
 		for (ip = itemtab; ip < itemmax; ip++) {
-			if (ip->i_token == UNDECLARED && (ip->i_scope && SCOPE_EXTERNAL)) {
+			if (ip->i_token == UNDECLARED && (ip->i_scope & SCOPE_EXTERNAL)) {
 				putrelcmd(RELCMD_EXTCHAIN);
 				// Chain value will have top two bits set appropriately
 				putrelextaddr(ip->i_chain);
@@ -5150,6 +5839,8 @@ int main(int argc, char *argv[])
 		for (tp = itemtab; tp < itemmax; tp++) {
 			if (tp->i_token == LABEL)
 				fprintf(fbds, "%04x a %s\n", tp->i_value, tp->i_string);
+			else if (tp->i_token == EQUATED)
+				fprintf(fbds, "%04x v %s\n", tp->i_value, tp->i_string);
 		}
 	}
 
@@ -5157,6 +5848,7 @@ int main(int argc, char *argv[])
 		fflush(fout);
 	if (writesyms)
 		outsymtab(writesyms);
+	compactsymtab();
 	if (eopt)
 		erreport();
 	if (!lopt && !sopt)
@@ -5176,6 +5868,21 @@ int main(int argc, char *argv[])
 	exit(counterr() > 0);
 }
 
+void equate(char *id, int value)
+{
+	struct item *it;
+
+	it = locate(id);
+	if (!it->i_token) {
+		nitems++;
+		it->i_value = value;
+		it->i_token = EQUATED;
+		it->i_scope = SCOPE_BUILTIN;
+		it->i_uses = 0;
+		it->i_string = malloc(strlen(id)+1);
+		strcpy(it->i_string, id);
+	}
+}
 
 /*
  *  set some data values before each pass
@@ -5193,7 +5900,6 @@ void setvars()
 	emitptr = emitbuf;
 	lineptr = linebuf;
 	ifptr = ifstack;
-	expifp = expif;
 	*ifptr = 0;
 	dollarsign = 0;
 	emit_addr = 0;
@@ -5215,6 +5921,32 @@ void setvars()
 	memset(seg_size, 0, sizeof(seg_size));
 	segchange = 0;
 	z80 = default_z80;
+	outrec = 0;
+
+	param_parse = 0;
+	arg_reset();
+
+	mfptr = 0;
+	mfseek(mfile, mfptr, 0);
+
+	// These are slighly harmful, but not too bad.  Only
+	// absolutely necessary for MAC compatibility.  But there's
+	// some use in having them available always.
+
+	equate("b", 0);
+	equate("c", 1);
+	equate("d", 2);
+	equate("e", 3);
+	equate("h", 4);
+	equate("l", 5);
+	equate("m", 6);
+	equate("a", 7);
+
+	equate("sp", 6);
+	equate("psw", 6);
+
+	// There are a large number of symbols to add to support
+	// "LXI H,MOV" and the like.
 }
 
 //
@@ -5236,15 +5968,6 @@ void clear()
 void setmem(int addr, int value, int type)
 {
 	value &= 0xff;
-	if (memory[addr] != value) {
-		if (outpass) {
-			if (!passfail)
-				err[pflag]++;
-		}
-		else
-			passretry = 1;
-	}
-
 	memory[addr] = value;
 	memflag[addr] |= type;
 }
@@ -5263,27 +5986,32 @@ void error(char *as)
 
 
 /*
- *  output the symbol table
+ * Compact the symbol table, removing unused, UNDECLARED entries,
+ * macros and built-in identifiers.
  */
-void putsymtab()
+void compactsymtab()
 {
 	struct item *tp, *fp;
-	int  i, j, k, t, rows;
-	char c, c1, seg = ' ';
-	int numcol = printer_output ? 4 : 1;
 
 	if (!nitems)
 		return;
 
-	/* compact the table so unused and UNDECLARED entries are removed */
-	tp = &itemtab[-1];
+	tp = itemtab;
+	tp--;
 	for (fp = itemtab; fp<itemmax; fp++) {
-		if (fp->i_token == UNDECLARED && !(fp->i_scope && SCOPE_EXTERNAL)) {
+		if (fp->i_token == UNDECLARED && !(fp->i_scope & SCOPE_EXTERNAL)) {
 			nitems--;
 			continue;
 		}
 		if (fp->i_token == 0)
 			continue;
+
+		// Don't list macros or internally defined symbols
+		if (fp->i_token == MNAME || (fp->i_scope & SCOPE_BUILTIN)) {
+			nitems--;
+			continue;
+		}
+
 		tp++;
 		if (tp != fp) {
 			tp->i_string = fp->i_string;
@@ -5300,6 +6028,20 @@ void putsymtab()
 
 	/*  sort the table */
 	custom_qsort(0, nitems-1);
+}
+
+/*
+ *  output the symbol table
+ */
+void putsymtab()
+{
+	int  i, j, k, t, rows;
+	char c, c1, seg = ' ';
+	int numcol = printer_output ? 4 : 1;
+	struct item *tp;
+
+	if (!nitems)
+		return;
 
 	title = "**  Symbol Table  **";
 
@@ -5332,7 +6074,7 @@ void putsymtab()
 				fprintf(fout, "%-15s%c", tp->i_string, c);
 
 				if (relopt)
-					seg = " '\"!"[tp->i_scope & SCOPE_SEGMASK];
+					seg = SEGCHAR(tp->i_scope & SCOPE_SEGMASK);
 
 				if (tp->i_value >> 16)
 					fprintf(fout, "%8x%c", tp->i_value, seg);
@@ -5428,8 +6170,10 @@ int nextmac()
 	int ch;
 
 	if (mlook) {
-		if (*mlook)
+		if (*mlook) {
 			ch = *mlook++;
+			addtoline(ch);
+		}
 		else
 			mlook = 0;
 	}
@@ -5448,226 +6192,396 @@ void mlex(char *look)
 	char  *p;
 	int  c;
 	int  t;
-	int octo;
-	int zcompat_save;
+	int quote = 0, ampdrop = 0;
+	struct item *param, *key;
 	char symbuf[TEMPBUFSIZE];
+	char *symbufmax = symbuf+TEMPBUFSIZE-1;
 
 	/*
 	 *  move text onto macro file, changing formal parameters
 	 */
 #ifdef	M_DEBUG
-	fprintf(stderr,"enter 'mlex'\n") ;
+	fprintf(stderr,"enter 'mlex' at %d\n", mfptr) ;
 #endif
 	inmlex++;
 
 	mlook = look;
 
 	c = nextmac();
-for (;;) {
-	octo = 0;
-	if (c == '#') {
-		c = nextmac();
-		if (charclass[c] != STARTER && charclass[c] != LETTER) {
-			putm('#');
-			continue;
-		}
-		octo = 1;
-	}
+	for (;;) {
+		int octo = 0, amp = 0, caret = 0;
 
-	switch(charclass[c]) {
-
-	case DIGIT:
-		while (numpart[c]) {
-			putm(c);
+		if (c == '#' || c == '&' || c == '^') {
+			int esc = c;
 			c = nextmac();
-		}
-		continue;
-
-	case STARTER:
-	case LETTER:
-		t = 0;
-		p = symbuf;
-		do {
-			if (p >= tempmax) {
-				*tempmax = '\0';
-				printf("was parsing '%s' in macro definition\n", tempbuf);
-				error(symlong);
+			if (charclass[c] != STARTER && charclass[c] != LETTER) {
+				if (esc != '&' || !ampdrop)
+					putm(esc);
+				ampdrop = 0;
+				continue;
 			}
-			*p++ = c;
-			if (t < MAXSYMBOLSIZE)
-				tempbuf[t++] = (c >= 'A' && c <= 'Z')  ?
-					c+'a'-'A' : c;
-			c = nextmac();
-		} while	(charclass[c]==LETTER || charclass[c]==DIGIT || charclass[c]==STARTER);
-
-		tempbuf[t] = 0;
-		*p++ = '\0';
-		p = symbuf;
-		// Bit of dancing to allow VERBs as parameters.
-		// We could allow anything if parm.element accepted more.
-		// Can't allow token expansion at this point.  Doesn't make
-		// sense and could screw things up.
-		zcompat_save = zcompat;
-		zcompat = 0;
-		t = tokenofitem(0, 0, 0);
-		if (t != ENDM)
-			t = tokenofitem(0, VERB, 0);
-
-		zcompat = zcompat_save;
-
-		if (t == MPARM) {
-			if (octo != yylval.itemptr->i_scope)
-				t = MPARM + 1;
+			if (esc == '#')
+				octo = 1;
+			else if (esc == '&')
+				amp = 1;
 			else
-				octo = 0;
+				caret = 1;
 		}
 
-		if (octo) { putm('#'); octo = 0; }
+		switch(charclass[c]) {
 
-		if (t != MPARM) {
-			for (p = symbuf; *p; p++)
-				putm(*p);
-		}
-		else {
-			if (*(yylval.itemptr->i_string) == '?' || yylval.itemptr->i_chain)
-				putm('\2');
-			else
-				putm('\1');
-			putm(yylval.itemptr->i_value + 'A');
-		}
-		if (t == ENDM) goto done;
-		continue;
-
-	case F_END:
-		printf("Warning: macro went until end of file.\n");
-		if (expptr) {
-			popsi();
-			c = nextmac();
+		case DIGIT:
+			while (numpart[c]) {
+				putm(c);
+				c = nextmac();
+			}
 			continue;
-		}
 
-		goto done;
+		case STARTER:
+		case LETTER:
+			t = 0;
+			p = symbuf;
+			do {
+				if (p >= symbufmax) {
+					*symbufmax = '\0';
+					printf("was parsing '%s' in macro definition\n", tempbuf);
+					error(symlong);
+				}
+				*p++ = c;
+				if (t < MAXSYMBOLSIZE)
+					tempbuf[t++] = (c >= 'A' && c <= 'Z')  ?
+						c+'a'-'A' : c;
+				c = nextmac();
+			} while	(charclass[c]==LETTER || charclass[c]==DIGIT || charclass[c]==STARTER);
 
-	default:
-		if (c == '\n') {
-			linecnt++;
+			tempbuf[t] = 0;
+			*p++ = '\0';
+			p = symbuf;
+
+			key = keyword(tempbuf);
+			t = key ? key->i_token : 0;
+
+			param = item_lookup(tempbuf, paramtab, PARAMTABSIZE);
+
+			// Accept almost anything as a parameter.  But a few
+			// keywords will just screw things up royally.
+			if (t != ENDM && t != REPT && t != IRPC && t != IRP && t != MACRO)
+				t = param->i_token;
+
+			// Caret escaping kills all expansion
+			// And interpretation of ENDM, etc.  For better or worse.
+			if (caret)
+				t = 0;
+
+			if (t == MPARM) {
+				int pfx = octo || amp || c == '&';
+				// # prefix only allowed if declared that way
+				if (octo != param->i_scope)
+					t = 0;
+				else
+					octo = 0;
+
+				// Expansion in quoted strings only with prefix character.
+				if (quote && !pfx && !zcompat)
+					t = 0;
+
+				amp = 0; // parameter substitution, eat '&'
+			}
+			else if (t && quote)
+				t = 0;
+
+			if (ampdrop)
+				amp = 0;
+
+			ampdrop = c == '&' && t == MPARM;
+
+			if (octo) putm('#');
+			if (amp) putm('&');
+
+			if (t != MPARM) {
+				for (p = symbuf; *p; p++)
+					putm(*p);
+			}
+			else {
+				if (*(param->i_string) == '?' || param->i_chain)
+					putm('\2');
+				else
+					putm('\1');
+				putm(param->i_value + 'A');
+			}
+			if (t == ENDM) {
+				if (--inmlex == 0)
+					goto done;
+			}
+			else if (t == REPT || t == IRPC || t == IRP || t == MACRO) {
+				inmlex++;
+			}
+
+			continue;
+
+		case F_END:
+			errwarn(warn_general, "macro definition went until end of file");
+			if (expptr) {
+				popsi();
+				c = nextmac();
+				continue;
+			}
+
+			goto done;
+
+		default:
+			switch (c) {
+			case '\n':
+				quote = 0;
+				list1();
+				break;
+			case ';':
+				if (!quote) {
+					while (c != '\n' && c != 0) {
+						putm(c);
+						c = nextmac();
+					}
+					continue;
+				}
+				break;
+			case '\'':
+			case '"':
+				if (c == quote)
+					quote = 0;
+				else
+					quote = c;
+				break;
+			default:
+				break;
+			}
+			if (c != '\1' && c != '`') putm(c);
+			c = nextmac();
 		}
-		if (c != '\1' && c != '`') putm(c);
-		c = nextmac();
 	}
-}
 
 	/*
 	 *  finish off the file entry
 	 */
 done:
 	while(c != EOF && c != '\n' && c != '\0') c = nextmac();
-	linecnt++;
-	putm('\n');
+	inmlex++;
+	list1();
+	inmlex--;
+	// WHY two newlines??
+//	putm('\n');
 	putm('\n');
 	putm(0);
 
-	for (c=0; c<ITEMTABLESIZE; c++)
-		if (itemtab[c].i_token == MPARM) {
-			itemtab[c].i_token = UNDECLARED;
+	// TODO - here's where we could save parameter names for MRAS
+	for (c = 0; c < PARAMTABSIZE; c++) {
+		if (paramtab[c].i_token == MPARM) {
+			free(paramtab[c].i_string);
+			paramtab[c].i_string = NULL;
+			paramtab[c].i_token = 0;
 		}
+	}
 	inmlex = 0;
 #ifdef	M_DEBUG
-	fprintf(stderr,"exit 'mlex'\n") ;
+	fprintf(stderr,"exit 'mlex' at %d\n", mfptr) ;
 #endif
 }
 
+int str_getch(struct argparse *ap)
+{
+	int ch = ap->user_peek;
+	if (ch >= 0) {
+		ap->user_peek = -1;
+		return ch;
+	}
+	if (!ap->user_ptr || ap->user_ptr[ap->user_int] == '\0')
+		return '\0';
 
+	return ap->user_ptr[ap->user_int++];
+}
+
+int arg_getch(struct argparse *ap)
+{
+	(void)ap; // suppress warning
+	return nextchar();
+}
+
+void arg_start()
+{
+	arg_reset();
+	arg_flag = 1;
+}
+
+void arg_reset()
+{
+	arg_flag = 0;
+
+	arg_state.arg = tempbuf;
+	arg_state.argsize = sizeof tempbuf;
+	arg_state.peek = &peekc;
+	arg_state.getch = arg_getch;
+	arg_state.macarg = 0;
+	arg_state.user_ptr = 0;
+	arg_state.user_int = 0;
+	arg_state.didarg = 0;
+	arg_state.numarg = 0;
+}
 
 /*
  *  lexical analyser for the arguments of a macro call
  */
-int getarg()
+int getarg(struct argparse *ap)
 {
 	int c;
 	char *p;
-	static int comma;
 	int quote;
+	int depth;
 
-	*tempbuf = 0;
-	yylval.cval = tempbuf;
-	while(charclass[c = nextchar()] == SPACE);
+	*ap->arg = 0;
+	while (charclass[c = ap->getch(ap)] == SPACE);
 
 	switch(c) {
 
 	case '\0':
-		popsi();
+		if (!ap->user_ptr)
+			popsi(); // a seemingly unlikely case?
 	case '\n':
 	case ';':
-		comma = 0;
-		return(skipline(c));
+		if (!ap->didarg && ap->numarg) {
+			*ap->peek = c;
+			ap->didarg = 1;
+			ap->numarg++;
+			return ARG;
+		}
+		ap->didarg = 0;
+		ap->numarg = 0;
+		return c;
 
 	case ',':
-		if (comma) {
-			comma = 0;
-			return(',');
+		if (!ap->didarg) {
+			ap->didarg = 1;
+			*ap->peek = c;
+			ap->numarg++;
+			return ARG;
 		}
-		else {
-			comma++;
-			return(ARG);
-		}
+		ap->didarg = 0;
+		return c;
 
 	case '\'':
 	case '\"':
 		quote = c;
-		p = tempbuf;
+		p = ap->arg;
 		if (!zcompat)
 			*p++ = c;
 
 		do {
-			c = nextchar();
+			c = ap->getch(ap);
 			if (c == '\0' || c == '\n') {
-				peekc = c;
+				*ap->peek = c;
 				*p = 0;
 				err[bflag]++;
+				ap->didarg = 1;
+				ap->numarg++;
 				return ARG;
 			}
 			else if (c == quote) {
-				if ((c = nextchar()) != quote) {
+				if ((c = ap->getch(ap)) != quote) {
 					if (!zcompat)
 						*p++ = quote;
-					peekc = c;
+					*ap->peek = c;
 					*p = '\0';
-					comma++;
+					ap->didarg = 1;
+					ap->numarg++;
 					return ARG;
 				}
 			}
 			else
 				*p++ = c;
-		} while (p < tempmax);
-		*tempmax = '\0';
-		printf("was parsing macro argument '%s'\n", tempbuf);
+		} while (p < ap->arg + ap->argsize - 1);
+		ap->arg[ap->argsize - 1] = '\0';
+		printf("was parsing macro argument '%s'\n", ap->arg);
+		error(symlong);
+		return 0; // not reached
+
+	case '<':
+		depth = 1;
+		p = ap->arg;
+		do {
+			c = ap->getch(ap);
+			if (c == '\0' || c == '\n') {
+				*ap->peek = c;
+				*p = 0;
+				err[bflag]++;
+				ap->didarg = 1;
+				ap->numarg++;
+				return ARG;
+			}
+			if (c == '>') {
+				depth--;
+				if (depth == 0) {
+					*p = '\0';
+					ap->didarg = 1;
+					ap->numarg++;
+					return ARG;
+				}
+			}
+			else if (c == '<')
+				depth++;
+
+			*p++ = c;
+		} while (p < ap->arg + ap->argsize - 1);
+		ap->arg[ap->argsize - 1] = '\0';
+		printf("was parsing macro argument '%s'\n", ap->arg);
 		error(symlong);
 		return 0; // not reached
 
 	default:  /* unquoted string */
-		p = tempbuf;
-		peekc = c;
-		do switch(c = nextchar()) {
+		if (c == '%' && ap->macarg) {
+			ap->didarg = 1;
+			ap->numarg++;
+			return c;
+		}
+
+		p = ap->arg;
+		*ap->peek = c;
+
+		do {
+			c = ap->getch(ap);
+			switch(c) {
 			case '\0':
 			case '\n':
 			case '\t':
 			case ' ':
 			case ',':
-				peekc = c;
+				*ap->peek = c;
 				*p = '\0';
-				comma++;
-				return(ARG);
+				ap->didarg = 1;
+				ap->numarg++;
+				return ARG;
+			case '^':
+				c = ap->getch(ap);
+				switch (c) {
+				case ',':
+				case '^':
+				case ' ':
+				case '\t':
+					*p++ = c;
+					break;
+				default:
+					*p++ = '^';
+					*ap->peek = c;
+					break;
+				}
+				break;
 			default:
 				*p++ = c;
-		} while (p < tempmax);
+			}
+		} while (p < ap->arg + ap->argsize - 1);
+		ap->arg[ap->argsize - 1] = '\0';
+		printf("was parsing macro argument '%s'\n", ap->arg);
 		error("macro argument too long");
 		return 0; // not reached
 	}
 }
-
-
-
 
 
 /*
@@ -5724,6 +6638,7 @@ void outpath(char *out, char *src, char *suff)
  */
 void putm(int c)
 {
+	mfseek(mfile, mfptr, 0);
 	mfptr++;
 	mfputc(c, mfile);
 }
@@ -5737,6 +6652,7 @@ int getm()
 {
 	int ch;
 
+	mfseek(mfile, floc, 0);
 	floc++;
 	ch = mfgetc(mfile);
 	if (ch == EOF) {
@@ -5759,6 +6675,7 @@ void popsi()
 		if (est[i].param) free(est[i].param);
 	}
 	floc = est[FLOC].value;
+	ifptr = est[MIF].param;
 	free(est);
 	expptr--;
 	est = expptr ? expstack[expptr-1] : 0;
@@ -5951,6 +6868,7 @@ void incbin(char *filename)
 	int ch;
 	int start = dollarsign;
 	int last = start;
+	int bds_count;
 
 	if (!fp) {
 		char ebuf[1024];
@@ -5959,8 +6877,24 @@ void incbin(char *filename)
 		return;
 	}
 
+	addtoline('\0');
+	if (outpass && bopt)
+		fprintf(fbds, "%04x %04x s %s", dollarsign, emit_addr, linebuf);
+
 	// Avoid emit() because it has a small buffer and it'll spam the listing.
+	bds_count = 0;
 	while ((ch = fgetc(fp)) != EOF) {
+		if (outpass && bopt) {
+			if (bds_count == 0)
+				fprintf(fbds, "%04x %04x d ", dollarsign, emit_addr);
+			fprintf(fbds, "%02x", ch);
+			bds_count++;
+			if (bds_count == 16) {
+				fprintf(fbds, "\n");
+				bds_count = 0;
+			}
+		}
+
 		if (segment == SEG_CODE)
 			setmem(emit_addr, ch, MEM_DATA);
 		emit_addr++;
@@ -5971,13 +6905,14 @@ void incbin(char *filename)
 
 		putbin(ch);
 		putrel(ch);
+		putout(ch);
 	}
+	if (outpass && bopt && bds_count)
+		fprintf(fbds, "\n");
 
 	fclose(fp);
 
 	// Do our own list() work as we emit bytes manually.
-
-	addtoline('\0');
 
 	if (outpass && iflist()) {
 		lineout();
@@ -5993,9 +6928,13 @@ void incbin(char *filename)
 
 		puthex(start >> 8, fout);
 		puthex(start, fout);
+		if (relopt)
+			fputc(SEGCHAR(segment), fout);
 		fprintf(fout, " .. ");
 		puthex(last >> 8, fout);
 		puthex(last, fout);
+		if (relopt)
+			fputc(SEGCHAR(segment), fout);
 
 		putc('\t', fout);
 
@@ -6008,9 +6947,26 @@ void incbin(char *filename)
 void dc(int count, int value)
 {
 	int start = dollarsign;
+	int bds_count;
+
+	addtoline('\0');
+	if (outpass && bopt)
+		fprintf(fbds, "%04x %04x s %s", dollarsign, emit_addr, linebuf);
 
 	// Avoid emit() because it has a small buffer and it'll spam the listing.
+	bds_count = 0;
 	while (count-- > 0) {
+		if (outpass && bopt) {
+			if (bds_count == 0)
+				fprintf(fbds, "%04x %04x d ", dollarsign, emit_addr);
+			fprintf(fbds, "%02x", value);
+			bds_count++;
+			if (bds_count == 16) {
+				fprintf(fbds, "\n");
+				bds_count = 0;
+			}
+		}
+
 		if (segment == SEG_CODE)
 			setmem(emit_addr, value, MEM_DATA);
 		emit_addr++;
@@ -6020,11 +6976,12 @@ void dc(int count, int value)
 
 		putbin(value);
 		putrel(value);
+		putout(value);
 	}
+	if (outpass && bopt && bds_count)
+		fprintf(fbds, "\n");
 
 	// Do our own list() work as we emit bytes manually.
-
-	addtoline('\0');
 
 	if (outpass && iflist()) {
 		lineout();
@@ -6040,9 +6997,17 @@ void dc(int count, int value)
 
 		puthex(start >> 8, fout);
 		puthex(start, fout);
-		fprintf(fout, " .. ");
+		if (relopt) {
+			fputc(SEGCHAR(segment), fout);
+			fprintf(fout, "..");
+		}
+		else
+			fprintf(fout, " .. ");
+
 		puthex((dollarsign - 1) >> 8, fout);
 		puthex((dollarsign - 1), fout);
+		if (relopt)
+			fputc(SEGCHAR(segment), fout);
 		putc(' ', fout);
 		puthex(value, fout);
 		putc('\t', fout);
@@ -6053,6 +7018,52 @@ void dc(int count, int value)
 	}
 	else
 		lsterr1();
+}
+
+#define OUTREC_SEG	outbuf[outrec]
+#define OUTREC_ADDR	((outbuf[outrec + 1] << 8) | outbuf[outrec + 2])
+#define OUTREC_LEN	outbuf[outrec + 3]
+#define OUTREC_DATA	outbuf[outrec + 4 + outlen]
+#define OUTREC_SIZEOF	5
+
+void new_outrec(void)
+{
+	OUTREC_LEN = outlen;
+	outrec += OUTREC_SIZEOF + outlen;
+
+	outlen = 0;
+	OUTREC_SEG = segment;
+	outbuf[outrec + 1] = seg_pos[segment] >> 8;
+	outbuf[outrec + 2] = seg_pos[segment];
+}
+
+void putout(int value)
+{
+	int addr = (OUTREC_ADDR + outlen) & 0xffff;
+	if (OUTREC_SEG != segment || addr != seg_pos[segment])
+		new_outrec();
+
+	if (pass2 && OUTREC_DATA != value && !passfail) {
+		char segname[2];
+		if (relopt)
+			sprintf(segname, "%c", SEGCHAR(segment));
+		else
+			segname[0] = '\0';
+
+		sprintf(detail, "%s error - $%04x%s changed from $%02x to $%02x",
+			errname[pflag], addr, segname, OUTREC_DATA, value);
+		errwarn(pflag, detail);
+
+		if (!outpass)
+			passretry = 1;
+	}
+	OUTREC_DATA = value;
+	outlen++;
+
+	if (outlen >= 256)
+		new_outrec();
+
+	advance_segment(1);
 }
 
 void advance_segment(int step)

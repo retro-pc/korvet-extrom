@@ -107,7 +107,7 @@ char *ptr;
 int size, nitems;
 FILE *f;
 {
-register unsigned int i = 0;
+register int i = 0;
 register unsigned char *p;
 	while (i < nitems) {
 		while (mptr + size >= mhead + msize) {

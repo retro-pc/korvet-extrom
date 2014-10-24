@@ -11,9 +11,14 @@ BASE	EQU	2000H		; База для размещения этого кода
 PORTA	EQU     0FB08H		; Порт A ВВ55 #3
 PORTC	EQU     0FB0AH		; Порт C ВВ55 #3
 TRAM	EQU	0FC00H		; Начало видеопамяти
+
 SYSREG14  EQU	0FA7FH		; регистр карты памяти
 SYSREG5C  EQU	0FF7FH		; регистр карты памяти
+; SYSREG6C  EQU	0BF7FH
+SYSREG3C  EQU	0FF7FH
+
 PCHDRV	EQU	4Ch		; подпрограмма печати байта через драйвер консоли ОПТС
+CONIN	EQU	49h		; подпрограмма ввода символа через драйвер консоли ОПТС
 
 
 ; started in config 14
@@ -33,31 +38,105 @@ PCHDRV	EQU	4Ch		; подпрограмма печати байта через д
 START:
 	DI
 	LD	SP,0F700h	; рабочий стек, размещаем в области F-макросов драйвера клавиатуры
+
+	call 	initLUT
+
 ; Печать промпта 	
 	LD	HL,HMSG
 	CALL	PSTR
 
-; 	ld 	a,0 		;=0 turn off susbst
+	call 	hw_test
+; 	halt
+
+
+	xor 	a
+	ld 	(flag_microdos),a
 
 	ld 	a,(0xf880)
 	and 	0x21 		;ctrl+shift
 	cp 	0x21
 
-	jp 	z,force_subst
-	xor 	a
+	jp 	z,force_default_bios
+	xor 	a		;turn off system substitution
 	jp 	restart_disable
 
-force_subst:
+force_default_bios:
 	ld 	hl,msgFORCEDDEFAULTBIOS
 	call 	PSTR
-	ld 	a,1
+; 	jp 	set_subst
 
+force_subst:
+; 	ld 	hl,msgFORCEDDEFAULTBIOS
+; 	call 	PSTR
+
+	ld 	hl,msgSUBST
+	call 	PSTR
+
+	ld 	a,(flag_microdos)
+
+	ld 	hl,msgMICRODOS
+	cp 	1
+	jp 	z,.print
+	ld 	hl,msgCPM
+.print:
+	call 	PSTR
+
+	ld 	hl,msgASK_SUBST
+	call 	PSTR
+
+WaitKey:
+	ld 	a,7
+	call 	PUTCH
+	call 	GETCH
+	and 	0x5F
+
+	cp 	0x0d 	;CR
+	jp 	nz,.printKEY
+
+	ld 	a,'Y'
+
+.printKEY:
+	ld 	(tmpKEY),a
+
+	cp 	'Y'
+	jp 	z,set_subst
+	cp 	'D'
+	jp 	z,set_subst
+
+	cp 	a,'C'
+	jp 	nz,.chkM
+
+	ld 	a,0
+	ld 	(flag_microdos),a
+	jp 	set_subst
+.chkM:
+	cp 	'M'
+	jp 	nz,WaitKey
+	ld 	a,1	
+	ld 	(flag_microdos),a
+
+
+set_subst:
+	ld 	a,(flag_microdos)
+	inc 	a
 
 restart_disable:
 	ld 	(TRK),A
-	ld 	a,0xA0 		;turn off system substitution
+	ld 	a,0xA0 		;system substitution
 	ld 	(CMD),a
+	xor 	a
+	ld 	(DRV),a
 	call 	SENDCMD
+
+	ld 	a,(tmpKEY)
+	or 	a
+	jp 	z,.noPrintKey
+	call 	PUTCH
+	ld 	hl,HCRLF
+	call	PSTR 	
+
+.noPrintKey:
+
 
 	ld 	a,0
 	ld 	(flag_unsupported),a
@@ -86,6 +165,9 @@ restart_disable:
 ;
 ; Вынимаем идущие подряд переменные LOADR, RUNADR, COUNT
 ;
+
+;TODO: add crc check!!!!!!!!!!!!!!!
+
 	LD	HL,SECBUF
 	LD	DE,LOADR	; начало блока переменных в памяти
 	LD	C,5		; всего 5 байтов
@@ -105,36 +187,16 @@ IL:
 	LD	HL,SECBUF+16	;  +16 - LSPT
 	LD	A,(HL)
 	LD	(DE),A
+
+	call 	CheckBootParams
+	jp 	nz,force_subst
 	
 	ld 	a,(0xf880)
 	and 	0x1
 	ld 	(mute_flag),a
 	jp 	z,skip_msg_1
 
-; Вывод параметров загрузки на экран
-	LD	HL,HMBASE
-	CALL	PSTR
-	LD	HL,LOADR
-	CALL	HEXW
-	LD	HL,HMRUN
-	CALL	PSTR
-	LD	HL,RUNADR
-	CALL	HEXW
-	LD	HL,HMPS
-	CALL	PSTR
-	LD	HL,SCOUNT
-	LD	A,(HL)
-	CALL	HEX2
-	LD	HL,HMSS
-	CALL	PSTR
-	LD	HL,SSIZE
-	LD	A,(HL)
-	CALL	HEX2
-	LD	HL,HMSP
-	CALL	PSTR
-	LD	HL,LSPT
-	LD	A,(HL)
-	CALL	HEX2
+	call 	ShowBootParams
 
 skip_msg_1:
 		
@@ -189,98 +251,12 @@ SSL2:
 	LD	A,E
 	CALL	HEX2
 
+	LD	HL,HCRLF
+	CALL	PSTR
+
 	;de - sectors to load
 
 skip_msg_2:
-
-;
-; ; Теперь DE содержит число загружаемых логических секторов. Делим это число на LSPT для получения числа загружаемых дорожек
-
-; 	LD	HL,LSPT
-; 	LD	L,(HL)
-; 	LD	H,0		; HL=LSPT
-; 	LD	C,0		; счетчик дорожек
-; ; Делимое - DE, делитель - HL. Убогий процессор 8080 аппаратно деление не поддерживает.
-; ;   Поэтому - 
-; ; Производим вычитание: DE=DE-HL по кольцу с подсчетом проходов
-; ; При получении отрицательного числа идем на выход
-
-; SPL1:
-; 	LD	A,E
-; 	SUB	L		; вычитаем младший байт
-; 	LD	E,A
-; 	LD	A,D
-; 	SBC	A,H		; вычитаем старший байт
-; 	LD	H,A
-; 	JP	M,SPL2		; получили отрицательное число - на выход
-; 	INC	C		; счетчик результата - ++
-; 	JP	SPL1
-; ; В результате получили C - полное число загружаемых дорожек
-; ;  Выводим это число на экран
-
-; SPL2:
-; 	halt
-; 	ld 	a,(mute_flag)
-; 	or 	a
-; 	jp 	z,skip_msg_3
-
-
-; 	LD	HL,HMTR
-; 	CALL	PSTR
-; 	LD	A,C
-; 	CALL	HEX2
-; 	LD	HL,HCRLF
-; 	CALL	PSTR
-
-; skip_msg_3:
-
-; ;----------------------------------------------------------------------
-; ;   Собственно загрузка системных дорожек в память с адреса LOADR
-; ;   c - счетчик дорожек, b - lspt
-; ;
-; 	LD	HL,LSPT
-; 	LD	B,(HL)		; B - число секторов на дорожке
-; 	LD	HL,(LOADR)	; HL - указатель позиции загрузки в памяти
-; SLL1:
-
-; 	PUSH	BC
-
-; 	PUSH	HL
-; 	LD	HL,SEC
-; 	LD	(HL),0		; Начинаем с сектора 0
-; 	POP	HL
-
-; 	LD	C,B		; C - счетчик секторов, начинается с LSPT
-; SLL2:
-
-; 	ld 	a,(mute_flag)
-; 	or 	a
-; 	jp 	z,skip_msg_star
-
-; 	LD	A,'*'		; прогресс-бар загружаемых секторов
-; 	CALL	PUTCH
-; skip_msg_star:
-
-; 	CALL	SENDCMD		; отправляем команду
-; 	CALL	GETSEC		; получаем и размещаем сектор
-
-; 	PUSH	HL
-; 	LD	HL,SEC
-; 	INC	(HL)		; номер сектора ++
-; 	POP	HL
-
-; 	DEC	C		; счетчик секторов дорожки --
-; 	JP	NZ,SLL2		; продолжаем загрузку всех секторов
-
-; 	PUSH	HL
-; 	LD	HL,TRK
-; 	INC	(HL)		; номер дорожки++
-; 	POP	HL
-
-; 	POP	BC
-; 	DEC	C		; счетчик дорожек --
-; 	JP	NZ,SLL1		; продолжаем загрузку всех дорожек
-;
 
 	;DE - sectors to load
 
@@ -310,6 +286,7 @@ ld_loop:
 	LD	A,'*'		; прогресс-бар загружаемых секторов
 	CALL	PUTCH
 skip_msg_star:
+	
 
 	CALL	SENDCMD		; отправляем команду
 	CALL	GETSEC		; получаем и размещаем сектор
@@ -335,8 +312,8 @@ load_done:
 
 ; Вся системная область диска загружена - можно запускать ОС
 ;	
-	LD	A,'@'		; Признак окончания загрузки - на экран
-	CALL	PUTCH
+; 	LD	A,'@'		; Признак окончания загрузки - на экран
+; 	CALL	PUTCH
 
 	call 	cpm_bios_patcher
 
@@ -348,6 +325,91 @@ load_done:
 	LD	HL,(RUNADR)
 	JP	(HL)		; уходим по адресу запуска
 	
+CheckBootParams:
+
+	LD	HL,LOADR
+	call 	FetchDEfromHL
+
+	ld 	a,d
+	cp 	0x22 		; load addr shiould be >0x2200
+	jp 	c,.BadBootParam
+
+	LD	HL,RUNADR
+	call 	FetchDEfromHL
+	ld 	a,d
+	cp 	0x22 		; run addr shiould be >0x2200
+	jp 	c,.BadBootParam
+
+	LD	HL,SCOUNT
+	LD	A,(HL)
+	or 	a
+	jp 	z,.BadBootParam
+	cp 	48 		;sectors to load < 48
+	jp 	nc,.BadBootParam
+
+	xor 	a
+	ret
+
+.BadBootParam:
+	call 	ShowBootParams
+	ld 	hl,msgBadBootParam
+	CALL	PSTR
+	xor 	a
+	inc 	a
+	ret
+
+msgBadBootParam:
+	db 	0x0d,0x0a
+	db 	'Incorrect boot parameters detected, fallback to default'
+	db 	0x0d,0x0a,0
+
+ShowBootParams:
+	; Вывод параметров загрузки на экран
+	LD	HL,HMBASE
+	CALL	PSTR
+	LD	HL,LOADR
+	CALL	HEXW
+	LD	HL,HMRUN
+	CALL	PSTR
+	LD	HL,RUNADR
+	CALL	HEXW
+	LD	HL,HMPS
+	CALL	PSTR
+	LD	HL,SCOUNT
+	LD	A,(HL)
+	CALL	HEX2
+	LD	HL,HMSS
+	CALL	PSTR
+	LD	HL,SSIZE
+	LD	A,(HL)
+	CALL	HEX2
+	LD	HL,HMSP
+	CALL	PSTR
+	LD	HL,LSPT
+	LD	A,(HL)
+	CALL	HEX2
+	ret
+
+initLUT:
+	ld      hl, 0xFAFB
+	ld      a, 0F8h 
+
+.iniLUT:                  
+	ld      (hl), a         ; F8,F9,FA,FB,FC,FD,FE,FF
+	inc     a
+	jp      nz, .iniLUT      ; F8,F9,FA,FB,FC,FD,FE,FF
+	
+	ld      bc, 1108h       ; A=0
+	
+.iniLUTGRP:                  
+	ld      (hl), a         ; 00,11,22,33,44,55,66,77
+	add     a, b
+	dec     c
+	jp      nz, .iniLUTGRP   ; 00,11,22,33,44,55,66,77
+
+	ret
+
+
 ;****************************************
 ;*  Прием байта из порта А по стробу    *
 ;****************************************
@@ -410,6 +472,14 @@ HEX2:	PUSH	AF
 	CALL	HEX1		; печатаем младший полубайт
 	RET
 
+HEX4:
+	push 	AF
+	ld 	a,h
+	call 	HEX2
+	ld 	a,l
+	call 	HEX2
+	pop 	AF
+	ret
 ;****************************************
 ;*  Печать слова (2 байта) из (HL)      *
 ;****************************************
@@ -420,6 +490,13 @@ HEXW:
 	DEC	HL		; младший байт
 	LD	A,(HL)
 	CALL	HEX2
+	RET
+
+FetchDEfromHL:
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)		; старший байт
+	DEC	HL		; младший байт
 	RET
 	
 		
@@ -502,6 +579,20 @@ PUTCH:
 	POP	HL
 	RET
 
+;A - chr
+GETCH:
+	EI
+	PUSH	HL
+	PUSH	BC
+	PUSH	DE
+	CALL	CONIN
+	POP	DE
+	POP	BC
+	POP	HL
+	DI
+	RET
+
+
 ; Командный пакет	
 CMD:	DB	1		; Команда чтения
 DRV:	DB	0
@@ -517,21 +608,34 @@ LSPT:	DS	1	; число логических секторов на дорожк�
 
 ; Текстовые строки для вывода на экран
 HMSG:   DB	1Fh ; очистка экрана
-	DB	"--EXTROM Secondary boot--",0dh,0ah,0	; текстовое сообщение на экран
-HMBASE: DB	"BASE: ",0
-HMRUN:  DB	"   START: ",0
-HMPS:   DB	"   PSECTORS: ",0
-HMSS:   DB	"   SSIZE: ",0
-HMSP:   DB	0dh,0ah,"LSPT: ",0
-HMLS:   DB	"   LSECTORS: ",0
-HMTR:   DB	"   TRACKS: ",0
+	DB	"--EXTROM Stage2 boot version 1.0 by Forh32 & ESL 2014--",0dh,0ah,0	; текстовое сообщение на экран
+HMBASE: DB	"BASE:",0
+HMRUN:  DB	" START:",0
+HMPS:   DB	" PSECTORS:",0
+HMSS:   DB	" SSIZE:",0
+HMSP:   DB	" LSPT:",0
+HMLS:   DB	" LSECTORS:",0
+; HMTR:   DB	" TRACKS:",0
 HCRLF:	DB	0dh,0ah,0
 mute_flag:
 	db 	0
+tmpKEY:
+	db 	0
+msgCPM:
+ 	db 	'CP/M',0
+msgMICRODOS:
+	db 	'MICRODOS',0
+msgSUBST:
+ 	db 	'Load default ',0 
+msgASK_SUBST:
+	db 	' ?(Enter/Y-yes, C-CP/M, M-microdos) ?',0	
+
 msgFORCEDDEFAULTBIOS:
 	db 	0dh,0ah,'!! Ctrl+Shift - pressed, forced to use BIOS SUBSTITUTION !!',0dh,0ah,0dh,0ah,0
 
-	include 	"extrom-patcher.asm"
+	include 	"hw_test.asm"
+	include 	"generator/V0/extrom-patcher.asm"
+
 
 ; Округляем размер всей секции до ближайших 256 байт вверх	
         DS      ((($>>8)+1)<<8)-$,0

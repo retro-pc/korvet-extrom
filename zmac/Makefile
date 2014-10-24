@@ -6,7 +6,7 @@ CXX=g++
 DEP=zmac.o mio.o doc.o zi80dis.o
 
 zmac: doc.inl $(DEP)
-	$(CXX) -o zmac $(DEP)
+	$(CXX) $(CXXFLAGS) -o zmac $(DEP)
 
 doc.inl: doc.c doc.txt
 	$(CC) -DMK_DOC -o doc doc.c

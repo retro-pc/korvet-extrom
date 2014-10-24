@@ -57,7 +57,7 @@ struct Opcode {
 
 #define VT(low, high)	(((low) << 8) | (high))
 
-static Opcode major[256] = {
+static Opcode z_major[256] = {
 	{ "nop",			0,				 4,  4 }, /* 00 */
 	{ "ld bc,%s",		WC,				10, 10 }, /* 01 */
 	{ "ld (bc),a",		0,				 7,  7 }, /* 02 */
@@ -347,7 +347,7 @@ static Opcode major[256] = {
 	{ "rst %s",			RST,			11, 11 }, /* ff */
 };
 
-static Opcode minor[3][256] = {
+static Opcode z_minor[3][256] = {
   {							/* cb */
 	{ "rlc b",			0,				 8 }, /* cb00 */
 	{ "rlc c",			0,				 8 }, /* cb01 */
@@ -1294,7 +1294,7 @@ void Zi80dis::Disassemble(const unsigned char *mem, int pc, bool memPointsToInst
 
 	int FETCH_TO(op);
 	int op0 = op;
-	const Opcode *code = &major[op];
+	const Opcode *code = &z_major[op];
 	int args;
 
 	if (code->tstates8080 > 256)
@@ -1326,25 +1326,25 @@ void Zi80dis::Disassemble(const unsigned char *mem, int pc, bool memPointsToInst
 #endif
 		args = code->args;
 	}
-	else if (!major[op].name)
+	else if (!z_major[op].name)
 	{
-		args = major[op0].args;
+		args = z_major[op0].args;
 		FETCH_TO(op);
 		// Check DD/FD prefix specially for no effect.
-		if (args == 1 && (minor[args][op].args & NOEFF))
+		if (args == 1 && (z_minor[args][op].args & NOEFF))
 		{
 			m_length--;
-			code = &minor[args][op];
+			code = &z_minor[args][op];
 		}
 		else
 		{
 			m_ocf++; // book says at most 2 op code fetches even for DDCB (TODO: really?)
-			while (!minor[args][op].name)
+			while (!z_minor[args][op].name)
 			{
-				args = minor[args][op].args;
+				args = z_minor[args][op].args;
 				FETCH_TO(op);
 			}
-			code = &minor[args][op];
+			code = &z_minor[args][op];
 		}
 	}
 
@@ -1368,7 +1368,7 @@ void Zi80dis::Disassemble(const unsigned char *mem, int pc, bool memPointsToInst
 		m_arg[0] = SIGN_EXTEND(op);
 		m_argType[0] = Zi80dis::argIndex;
 		FETCH_TO(op);
-		code = &minor[0][op];
+		code = &z_minor[0][op];
 		
 		{
 			// Find (hl) in normal instruction description.

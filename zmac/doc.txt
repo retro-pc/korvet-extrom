@@ -199,12 +199,13 @@ _label equ 100_
 |Define a symbol to have a fixed value.  The symbol can be used before it
 |is defined.  A symbol defined with _equ_ or as a label can be defined only
 |once, except that a symbol defined with _equ_ may be redefined to the
-|same value.
+|same value.  _=_ can be used instead of _equ_.
 
 _label defl 200_
 |Define a symbol to have a changeable value.  The symbol cannot be used
 |before it is defined, and it can be redefined to a different value later
-|with another _defl_. _aset_ is a synonym.
+|with another _defl_. _aset_ and _set_ are synonyms (despite _set_ also being
+a Z-80 mnemonic).
 
 _min_
 
@@ -269,6 +270,9 @@ _include file_
 |include path search rules, but the filename arg
 |lacks the angle brackets or quotes (though single or double quotes may be used).
 |_read_ is a synonym.
+
+_maclib file_
+|Like _include_ but adds _.lib_ to the file name so includes _file.lib_.
 
 _comment X_
 |Suspend assembly until the next occurence of character _X_ on a line.
@@ -500,7 +504,7 @@ list other labels that will be treated locally:
 Each time the macro is expanded the local labels are replaced with unique
 names thus avoiding multiple definition problems.
 
-For compatability with MRAS, macro arguments may be preceeded by _##_
+For compatability with MRAS, macro arguments may be preceeded by _#_
 in their definition and use.
 
 Any _`_ (backquote) in a macro is ignored thus allowing a macro to
@@ -513,6 +517,11 @@ construct identifiers.  For example:
  _######endm_
 
 Invoking _move i_ will construct a _ldir_ block move instruction.
+
+recursive definitions
+exitm
+rept, irp, irpc
+
 ---
 .Compatibility
 

@@ -46,8 +46,11 @@ void doc(void)
 		return;
 	}
 	inl = fopen("doc.inl", "w");
-	if (inl)
-		fprintf(inl, "static char *documentation =\n");
+	if (!inl) {
+		fprintf(stderr, "Cannot write 'doc.inl'\n");
+		return;
+	}
+	fprintf(inl, "static char *documentation =\n");
 #else
 	char *dp = documentation;
 #endif
