@@ -848,7 +848,7 @@ void send_dir() {
 void send_folders() {
 
     unsigned char* sbuf=getsbufptr();  // буфер сектора VinxFS
-    unsigned int i,res,cnt;
+    unsigned int i,res,cnt=0;
 
     fs_select(5);   // блок для служебных файлов
     sbuf[0]=0;  // корень карты
