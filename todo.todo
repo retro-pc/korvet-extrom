@@ -7,9 +7,13 @@
  ☐ есть ли поддержка LFN
  ☐ эмулятор падал если текущая папка не существует и вызываем mount /l
  ☐ 81 — смонтировать образ
-    в эмуляторе флаг RO ставился навсегда и его было невозможно снять
-    void emu_getfilename() {
-        ...
-        -if (e_trk != 0) drive_roflag[e_drv]=1;             // защита от записи
-        +drive_roflag[e_drv]=e_trk;                         // защита от записи
+    ☐ в эмуляторе флаг RO ставился навсегда и его было невозможно снять
+        void emu_getfilename() {
+            ...
+            -if (e_trk != 0) drive_roflag[e_drv]=1;             // защита от записи
+            +drive_roflag[e_drv]=e_trk;                         // защита от записи
 
+   ☐ в эмуляторе обнуляется 13 байт имени насильно
+       void emu_getfilename() {
+        ...
+        drive_filename[e_drv][EMU_FNAME_SIZE-1]=0;
